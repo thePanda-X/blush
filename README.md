@@ -42,11 +42,18 @@ under the hood over the [Agent Client Protocol](https://agentclientprotocol.com)
 ## Install
 
 ```sh
-cargo install --path .
+make          # detects the OS, checks prerequisites, builds in release mode, installs
 blush
 ```
 
-Or build it with `cargo build --release`; the binary is `target/release/blush` (`blush.exe` on Windows).
+`make` installs to `~/.cargo/bin`, which rustup already puts on your PATH. On Windows,
+`make` runs its recipes in PowerShell and adds the folder to your user PATH if it's missing.
+On macOS it also clears the quarantine flag and ad-hoc signs the binary. Other targets:
+`make build`, `make install BINDIR=/usr/local/bin`, `make uninstall`, `make adapter`
+(pre-install or update the Claude Code adapter), `make test`, `make clean`.
+
+On Windows you need GNU Make (`choco install make` or `winget install GnuWin32.Make`).
+Or skip make entirely with `cargo install --path .`.
 
 ## Usage
 
