@@ -133,7 +133,7 @@ impl<'t> Renderer<'t> {
     fn indent_prefix(&self) -> Vec<Span<'static>> {
         let mut p = Vec::new();
         for _ in 0..self.quote_depth {
-            p.push(Span::styled("┃ ", Style::default().fg(self.theme.gray_dim)));
+            p.push(Span::styled("┃ ", Style::default().fg(self.theme.md.quote_bar.unwrap_or(self.theme.gray_dim))));
         }
         let list_indent = self.lists.len().saturating_sub(1) * 2 + if self.lists.is_empty() { 0 } else { 2 };
         if list_indent > 0 {
@@ -158,7 +158,7 @@ impl<'t> Renderer<'t> {
 
     fn quote_prefix(&self) -> Vec<Span<'static>> {
         (0..self.quote_depth)
-            .map(|_| Span::styled("┃ ", Style::default().fg(self.theme.gray_dim)))
+            .map(|_| Span::styled("┃ ", Style::default().fg(self.theme.md.quote_bar.unwrap_or(self.theme.gray_dim))))
             .collect()
     }
 
@@ -258,7 +258,7 @@ impl<'t> Renderer<'t> {
                     self.flush_paragraph();
                     self.blank();
                     self.quote_depth += 1;
-                    self.push_style(|s| s.fg(self.theme.gray_bright).add_modifier(Modifier::ITALIC));
+                    self.push_style(|s| s.fg(self.theme.md.quote_text.unwrap_or(self.theme.gray_bright)).add_modifier(Modifier::ITALIC));
                 }
                 Tag::CodeBlock(kind) => {
                     self.flush_paragraph();
@@ -290,10 +290,10 @@ impl<'t> Renderer<'t> {
                         }
                         _ => if depth > 1 { "◦ ".to_string() } else { "• ".to_string() },
                     };
-                    self.item_prefix = Some(vec![Span::styled(marker, Style::default().fg(self.theme.gray))]);
+                    self.item_prefix = Some(vec![Span::styled(marker, Style::default().fg(self.theme.md.bullet.unwrap_or(self.theme.gray)))]);
                 }
                 Tag::Emphasis => self.push_style(|s| s.add_modifier(Modifier::ITALIC)),
-                Tag::Strong => self.push_style(|s| s.add_modifier(Modifier::BOLD).fg(self.theme.text)),
+                Tag::Strong => self.push_style(|s| s.add_modifier(Modifier::BOLD).fg(self.theme.md.strong.unwrap_or(self.theme.text))),
                 Tag::Strikethrough => self.push_style(|s| s.add_modifier(Modifier::CROSSED_OUT)),
                 Tag::Link { dest_url, .. } => {
                     self.link = Some(dest_url.to_string());
@@ -376,11 +376,11 @@ impl<'t> Renderer<'t> {
             Event::Rule => {
                 self.flush_paragraph();
                 self.emit_blank_if_pending();
-                self.out.push(Line::from(Span::styled("───", Style::default().fg(self.theme.gray_dim))));
+                self.out.push(Line::from(Span::styled("───", Style::default().fg(self.theme.md.rule.unwrap_or(self.theme.gray_dim)))));
                 self.blank();
             }
             Event::TaskListMarker(done) => {
-                let (m, c) = if done { ("✓ ", self.theme.success) } else { ("○ ", self.theme.gray) };
+                let (m, c) = if done { ("✓ ", self.theme.success) } else { ("○ ", self.theme.md.bullet.unwrap_or(self.theme.gray)) };
                 self.item_prefix = Some(vec![Span::styled(m, Style::default().fg(c))]);
             }
             Event::Html(h) | Event::InlineHtml(h) => {
@@ -416,7 +416,7 @@ impl<'t> Renderer<'t> {
                     let target = self.width.saturating_sub(label.len() + 1);
                     if used < target {
                         l.spans.push(Span::styled(" ".repeat(target - used), fill));
-                        l.spans.push(Span::styled(label.to_string(), Style::default().fg(self.theme.gray_dim).bg(bg)));
+                        l.spans.push(Span::styled(label.to_string(), Style::default().fg(self.theme.md.rule.unwrap_or(self.theme.gray_dim)).bg(bg)));
                     }
                 }
                 self.out.push(pad_line(l, self.width, fill));
@@ -441,7 +441,7 @@ impl<'t> Renderer<'t> {
             }
         }
         let total: usize = widths.iter().sum::<usize>() + ncols.saturating_sub(1) * 3;
-        let border = Style::default().fg(self.theme.gray_dim);
+        let border = Style::default().fg(self.theme.md.rule.unwrap_or(self.theme.gray_dim));
         let prefix = self.indent_prefix();
         if total + 2 > self.width {
             // Too wide: one "header: value" line per cell.
@@ -456,7 +456,7 @@ impl<'t> Renderer<'t> {
                     }
                     spans.extend(c.iter().cloned());
                     let first = if ci == 0 {
-                        vec![Span::styled("• ", Style::default().fg(self.theme.gray))]
+                        vec![Span::styled("• ", Style::default().fg(self.theme.md.bullet.unwrap_or(self.theme.gray)))]
                     } else {
                         vec![Span::raw("  ")]
                     };
@@ -549,6 +549,27 @@ mod tests {
         let t = Theme::blush();
         let out = plain(&render("# Title\n\nSome **bold** text.\n\n- one\n- two\n", 40, &t));
         assert_eq!(out, vec!["Title", "", "Some bold text.", "", "• one", "• two"]);
+    }
+
+    #[test]
+    fn blush_is_pinker_than_blush_light() {
+        use ratatui::style::Color;
+        let md = "Some **bold** and `code`.\n\n- one\n\n> quoted\n\n---\n";
+        let fg = |t: &Theme, needle: &str| -> Option<Color> {
+            render(md, 40, t).iter().flat_map(|l| l.spans.iter()).find(|s| s.content.contains(needle)).and_then(|s| s.style.fg)
+        };
+        let pink = Theme::blush();
+        let light = Theme::blush_light();
+        assert_eq!(fg(&pink, "•"), Some(pink.accent), "bullets are pink");
+        assert_eq!(fg(&light, "•"), Some(light.gray), "blush-light keeps grey bullets");
+        assert_eq!(fg(&pink, "bold"), pink.md.strong);
+        assert_eq!(fg(&light, "bold"), Some(light.text));
+        assert_eq!(fg(&pink, "┃"), pink.md.quote_bar);
+        assert_eq!(fg(&pink, "───"), pink.md.rule);
+        assert_ne!(fg(&pink, "code"), fg(&light, "code"));
+        // Themes derived from blush-light don't pick up the pink accents.
+        assert!(Theme::by_name("night").unwrap().md.bullet.is_none());
+        assert_eq!(Theme::by_name("blush-light").unwrap().name, "blush-light");
     }
 
     #[test]

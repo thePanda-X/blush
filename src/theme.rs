@@ -1,7 +1,8 @@
 //! Central color theme. Every color in the TUI is drawn from a [`Theme`].
 //!
-//! The default theme is `blush`: a neutral grey canvas (#1b1b1f) with a light
-//! pink accent (#f2b8cf).
+//! The default theme is `blush`: a neutral grey canvas (#1b1b1f) with pink
+//! (#f2b8cf) carried through headings, lists, emphasis, code and links.
+//! `blush-light` is the same canvas with pink used only sparingly.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -60,12 +61,31 @@ pub struct Theme {
     pub h4: Color,
     pub code_inline: Color,
     pub md_text: Color,
+    /// Optional markdown accents; unset falls back to the neutral greys.
+    pub md: MdAccents,
 
     pub syntax_theme: &'static str,
 }
 
+/// Extra markdown colors a theme may set. Each `None` keeps the neutral
+/// default noted on the field.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MdAccents {
+    /// List bullets, numbers and open task boxes (default: gray).
+    pub bullet: Option<Color>,
+    /// **Bold** text (default: text).
+    pub strong: Option<Color>,
+    /// The `┃` bar of block quotes (default: gray_dim).
+    pub quote_bar: Option<Color>,
+    /// Block quote text (default: gray_bright).
+    pub quote_text: Option<Color>,
+    /// Horizontal rules, table borders, code block labels (default: gray_dim).
+    pub rule: Option<Color>,
+}
+
 pub const THEME_NAMES: &[(&str, &str)] = &[
-    ("blush", "Grey canvas, light pink accent (default)"),
+    ("blush", "Grey canvas, pink headings, lists, code and links (default)"),
+    ("blush-light", "Grey canvas with a light touch of pink"),
     ("night", "Neutral near-black with a violet accent"),
     ("rosepine", "Muted Rosé-Pine-Moon inspired palette"),
     ("day", "Light theme for bright terminals"),
@@ -76,6 +96,7 @@ impl Theme {
     pub fn by_name(name: &str) -> Option<Theme> {
         match name.trim().to_ascii_lowercase().as_str() {
             "blush" | "default" | "dark" | "pink" => Some(Self::blush()),
+            "blush-light" | "blushlight" | "blush_light" => Some(Self::blush_light()),
             "night" | "groknight" | "grok-night" => Some(Self::night()),
             "rosepine" | "rose-pine" | "rosepine-moon" => Some(Self::rosepine()),
             "day" | "light" => Some(Self::day()),
@@ -84,9 +105,36 @@ impl Theme {
         }
     }
 
+    /// The default: `blush-light`'s canvas with pink through the whole reply.
     pub fn blush() -> Theme {
+        let pink = rgb(0xf2, 0xb8, 0xcf);
         Theme {
             name: "blush",
+            accent_thinking: rgb(0xe3, 0xa0, 0xc4),
+            border_active: rgb(0x6a, 0x4a, 0x5b),
+            scrollbar_fg: rgb(0x4d, 0x38, 0x44),
+            h1: rgb(0xff, 0x8f, 0xc0),
+            h2: pink,
+            h3: rgb(0xf7, 0xcc, 0xde),
+            h4: rgb(0xc9, 0x9a, 0xb1),
+            code_inline: rgb(0xf7, 0xa1, 0xc8),
+            link: rgb(0xe4, 0xa3, 0xe0),
+            md_text: rgb(0xe2, 0xd9, 0xde),
+            md: MdAccents {
+                bullet: Some(pink),
+                strong: Some(rgb(0xfa, 0xd4, 0xe4)),
+                quote_bar: Some(rgb(0xa8, 0x65, 0x80)),
+                quote_text: Some(rgb(0xd9, 0xb3, 0xc6)),
+                rule: Some(rgb(0x7a, 0x4e, 0x63)),
+            },
+            ..Self::blush_light()
+        }
+    }
+
+    /// The original palette: grey canvas, pink kept to the accents.
+    pub fn blush_light() -> Theme {
+        Theme {
+            name: "blush-light",
             is_light: false,
             bg: rgb(0x1b, 0x1b, 0x1f),
             bg_raised: rgb(0x26, 0x26, 0x2b),
@@ -121,6 +169,7 @@ impl Theme {
             h4: rgb(0x93, 0x90, 0x99),
             code_inline: rgb(0x8f, 0xd6, 0xc9),
             md_text: rgb(0xd6, 0xd3, 0xd9),
+            md: MdAccents::default(),
             syntax_theme: "base16-ocean.dark",
         }
     }
@@ -151,7 +200,7 @@ impl Theme {
             code_inline: rgb(58, 149, 171),
             md_text: rgb(200, 200, 200),
             model: rgb(26, 188, 156),
-            ..Self::blush()
+            ..Self::blush_light()
         }
     }
 
@@ -182,7 +231,7 @@ impl Theme {
             code_inline: rgb(0x9c, 0xcf, 0xd8),
             md_text: rgb(0xe0, 0xde, 0xf4),
             model: rgb(0xea, 0x9a, 0x97),
-            ..Self::blush()
+            ..Self::blush_light()
         }
     }
 
@@ -223,6 +272,7 @@ impl Theme {
             h4: rgb(0x6a, 0x66, 0x6e),
             code_inline: rgb(0x0f, 0x7a, 0x6e),
             md_text: rgb(0x2a, 0x27, 0x2e),
+            md: MdAccents::default(),
             syntax_theme: "InspiredGitHub",
         }
     }
@@ -264,6 +314,7 @@ impl Theme {
             h4: Color::Gray,
             code_inline: Color::Cyan,
             md_text: Color::Reset,
+            md: MdAccents::default(),
             syntax_theme: "base16-ocean.dark",
         }
     }

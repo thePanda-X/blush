@@ -266,7 +266,8 @@ and it accepts the `_` and `+` prefixes.
 
 | Theme | Description |
 |---|---|
-| `blush` | A grey canvas with a light pink accent. This is the default. |
+| `blush` | A grey canvas with pink through every reply: headings, bullets, bold text, inline code, links, quotes, and rules. This is the default. |
+| `blush-light` | The same grey canvas with only a light touch of pink, the original look |
 | `night` | Neutral near-black with a violet accent |
 | `rosepine` | A muted palette inspired by Rosé Pine Moon |
 | `day` | A light theme for bright terminals |
@@ -281,7 +282,7 @@ blush creates `~/.blush/config.toml` the first time it runs. Set `BLUSH_HOME` to
 
 ```toml
 [ui]
-theme = "blush"          # blush | night | rosepine | day | terminal
+theme = "blush"          # blush | blush-light | night | rosepine | day | terminal
 accent = "#f2b8cf"       # optional override
 background = "#1b1b1f"   # optional override
 show_timestamps = true
