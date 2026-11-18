@@ -133,7 +133,8 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `↑` `↓` · `←` `→` · `Enter` · `y` | In the scrollback: select an entry, fold or unfold it, open it in the viewer, copy it |
 | `o` / `r` | In the scrollback: open the selected tool's file, or reveal it in Explorer / Finder |
 | `Shift+←` / `Shift+→` | Jump between turns |
-| `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks |
+| `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks (and, in compact mode, all groups) |
+| `Ctrl+G` | Toggle the compact layout |
 | `PgUp` / `PgDn`, mouse wheel | Scroll |
 | Click | Click a block to select it; click its header to fold it |
 | `Ctrl+.` / `F1` | Show all shortcuts |
@@ -162,6 +163,7 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `/timeline` · `/undo` · `/redo` | Browse and restore Time Machine snapshots |
 | `/after <task>` | Queue a task to run once Claude finishes |
 | `/narrator` | Turn spoken turn summaries on or off |
+| `/compact-mode` | Toggle the compact layout (same as `Ctrl+G`) |
 | `/quit` (`/exit`, `/q`) | Quit |
 
 Every command Claude Code advertises works too, including `/compact`, `/review`, and your own
@@ -171,6 +173,27 @@ Type **`@path`** to fuzzy-search files in the project. The file you pick is atta
 as a resource link.
 
 ## Power tools
+
+### Compact layout
+
+Press **`Ctrl+G`** (or run `/compact-mode`) to fold each run of tool calls and thinking blocks into
+a single line between Claude's replies:
+
+```
+  ❯ add a div function that raises on zero
+
+  ◆ 2 tools · 1 thought · 1 edit +9 -1  6s
+
+  I added div to calc.py …
+```
+
+While Claude works, the line pulses and shows the current step (`Running cargo test`, `Thinking…`).
+To open just one group, select it and press `→` or `Enter`, or click it. A `▾` header line appears
+above the group. Click that header, or press `←` on any entry in the group, to fold it back.
+`Ctrl+O` opens or closes every group at once, and `y` or `f` on a folded group copies or views
+everything inside it.
+Only runs of two or more blocks are grouped, because a single tool call already takes one line.
+The setting is saved as `ui.compact`.
 
 ### Per-turn model and effort
 
@@ -265,6 +288,7 @@ mouse = true
 show_thinking = true
 expand_thinking = false
 animations = true
+compact = false          # group tool calls & thinking between replies (Ctrl+G)
 
 [agent]
 default_mode = "bypassPermissions"   # default | acceptEdits | plan | auto | bypassPermissions

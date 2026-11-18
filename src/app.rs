@@ -203,6 +203,8 @@ pub struct LayoutInfo {
     pub entry_rows: Vec<(u16, u16, usize, usize, usize)>,
     pub stop_button: Option<Rect>,
     pub narrator_button: Option<Rect>,
+    /// Compact mode: (screen row, anchor entry) of expanded groups' header lines.
+    pub group_rows: Vec<(u16, usize)>,
     pub total_lines: usize,
     pub view_height: usize,
     pub card_area: Option<Rect>,
@@ -304,6 +306,7 @@ pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("redo", "Restore files to the next snapshot"),
     ("after", "Queue a task to run when Claude finishes"),
     ("narrator", "Read a summary of each turn aloud"),
+    ("compact-mode", "Group tool calls and thinking between responses"),
     ("context", "Show context window usage"),
     ("session-info", "Show session details"),
     ("thinking", "Show / hide thinking blocks"),
@@ -1537,6 +1540,7 @@ impl App {
                 }
             }
             "narrator" => self.toggle_narrator(),
+            "compact-mode" => self.toggle_compact(),
             "context" => {
                 let s = &self.session;
                 let msg = if s.size > 0 {
@@ -1943,6 +1947,14 @@ impl App {
                     self.focus = Focus::Prompt;
                     return;
                 }
+                if let Some(&(_, anchor)) = self.layout.group_rows.iter().find(|(gy, _)| *gy == y) {
+                    if self.layout.scroll_area.contains((x, y).into()) {
+                        self.set_group_open(anchor, false);
+                        self.selected = Some(anchor);
+                        self.focus = Focus::Scrollback;
+                        return;
+                    }
+                }
                 if self.layout.scroll_area.contains((x, y).into()) {
                     let hit = self.layout.entry_rows.iter().find(|(y0, y1, _, _, _)| y >= *y0 && y < *y1).cloned();
                     if let Some((y0, _, idx, header_rows, first_row)) = hit {
@@ -1960,7 +1972,44 @@ impl App {
         }
     }
 
+    /// The compact-mode group `idx` belongs to, if compact mode is on.
+    pub fn group_of(&self, idx: usize) -> Option<(usize, usize)> {
+        if !self.config.ui.compact {
+            return None;
+        }
+        self.transcript.groups().into_iter().find(|(s, e)| idx >= *s && idx < *e)
+    }
+
+    /// `idx` anchors a group that is currently collapsed into one line.
+    pub fn is_collapsed_group(&self, idx: usize) -> bool {
+        self.group_of(idx).is_some_and(|(s, _)| s == idx && !self.transcript.entries[s].group_open)
+    }
+
+    fn set_group_open(&mut self, anchor: usize, open: bool) {
+        if let Some(e) = self.transcript.entries.get_mut(anchor) {
+            e.group_open = open;
+        }
+        self.ensure_selected_visible = true;
+    }
+
+    pub fn toggle_compact(&mut self) {
+        self.config.ui.compact = !self.config.ui.compact;
+        let _ = self.config.save();
+        // Keep the selection on something that's still shown.
+        if let Some(sel) = self.selected {
+            if let Some((s, _)) = self.group_of(sel).filter(|(s, _)| !self.transcript.entries[*s].group_open) {
+                self.selected = Some(s);
+            }
+            self.ensure_selected_visible = true;
+        }
+        self.toast(if self.config.ui.compact { "Compact layout on" } else { "Compact layout off" });
+    }
+
     fn toggle_fold(&mut self, idx: usize) {
+        if self.is_collapsed_group(idx) {
+            self.set_group_open(idx, true);
+            return;
+        }
         if let Some(e) = self.transcript.entries.get_mut(idx) {
             if e.foldable() {
                 e.fold = if e.fold == Fold::Expanded { Fold::Collapsed } else { Fold::Expanded };
@@ -1970,6 +2019,20 @@ impl App {
     }
 
     fn set_fold(&mut self, idx: usize, fold: Fold) {
+        if let Some((s, _)) = self.group_of(idx) {
+            let open = self.transcript.entries[s].group_open;
+            if fold == Fold::Expanded && !open {
+                self.set_group_open(s, true);
+                return;
+            }
+            // ← on a member that has nothing left to fold closes its group.
+            let e = &self.transcript.entries[idx];
+            if fold == Fold::Collapsed && open && (!e.foldable() || e.fold == Fold::Collapsed) {
+                self.set_group_open(s, false);
+                self.selected = Some(s);
+                return;
+            }
+        }
         if let Some(e) = self.transcript.entries.get_mut(idx) {
             if e.foldable() && e.fold != fold {
                 e.fold = fold;
@@ -1979,13 +2042,27 @@ impl App {
     }
 
     fn visible_entries(&self) -> Vec<usize> {
+        let hidden: Vec<(usize, usize)> = if self.config.ui.compact {
+            self.transcript.groups().into_iter().filter(|(s, _)| !self.transcript.entries[*s].group_open).collect()
+        } else {
+            vec![]
+        };
         self.transcript
             .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| self.transcript.show_thinking || !matches!(e.block, Block::Thought { .. }))
+            .filter(|(i, _)| !hidden.iter().any(|(s, e)| *i > *s && *i < *e))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Plain text of a selection; a collapsed group yields all its members.
+    fn selection_text(&self, idx: usize) -> String {
+        match self.group_of(idx).filter(|_| self.is_collapsed_group(idx)) {
+            Some(g) => self.transcript.group_members(g).iter().map(|e| e.plain_text()).collect::<Vec<_>>().join("\n\n"),
+            None => self.transcript.entries[idx].plain_text(),
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -2184,13 +2261,27 @@ impl App {
             }
             return;
         }
+        if ctrl && matches!(k.code, KeyCode::Char('g')) {
+            self.toggle_compact();
+            return;
+        }
         if ctrl && matches!(k.code, KeyCode::Char('o')) {
-            // expand / collapse all tool output
-            let any_collapsed = self.transcript.entries.iter().any(|e| e.foldable() && e.fold == Fold::Collapsed);
+            // expand / collapse all tool output (and, in compact mode, every group)
+            let groups = if self.config.ui.compact { self.transcript.groups() } else { vec![] };
+            let any_collapsed = self.transcript.entries.iter().any(|e| e.foldable() && e.fold == Fold::Collapsed)
+                || groups.iter().any(|(s, _)| !self.transcript.entries[*s].group_open);
             for e in self.transcript.entries.iter_mut() {
                 if e.foldable() {
                     e.fold = if any_collapsed { Fold::Expanded } else { Fold::Collapsed };
                     e.touch();
+                }
+            }
+            for (s, _) in groups {
+                self.transcript.entries[s].group_open = any_collapsed;
+            }
+            if let Some(sel) = self.selected.filter(|_| !any_collapsed) {
+                if let Some((s, _)) = self.group_of(sel) {
+                    self.selected = Some(s);
                 }
             }
             return;
@@ -2287,7 +2378,7 @@ impl App {
             }
             KeyCode::Char('y') => {
                 if let Some(i) = self.selected {
-                    let t = self.transcript.entries[i].plain_text();
+                    let t = self.selection_text(i);
                     self.copy(&t);
                 }
             }
@@ -2305,6 +2396,10 @@ impl App {
                     }
                 }
             }
+            KeyCode::Enter if self.selected.is_some_and(|i| self.is_collapsed_group(i)) => {
+                let i = self.selected.unwrap();
+                self.set_group_open(i, true);
+            }
             KeyCode::Enter | KeyCode::Char('f') => self.open_viewer(),
             KeyCode::Char(c) if !ctrl && c.is_alphanumeric() => {
                 // Typing jumps back to the prompt.
@@ -2319,7 +2414,11 @@ impl App {
 
     /// The file a selected tool entry touched, if it exists on disk.
     pub fn selected_path(&self) -> Option<PathBuf> {
-        let e = self.transcript.entries.get(self.selected?)?;
+        let sel = self.selected?;
+        if self.is_collapsed_group(sel) {
+            return None;
+        }
+        let e = self.transcript.entries.get(sel)?;
         let Block::Tool(t) = &e.block else { return None };
         let raw = t.locations.first().cloned().or_else(|| {
             ["file_path", "path", "notebook_path"]
@@ -2331,6 +2430,11 @@ impl App {
     }
 
     fn open_viewer(&mut self) {
+        if let Some(i) = self.selected.filter(|i| self.is_collapsed_group(*i)) {
+            let text = self.selection_text(i);
+            self.overlay = Overlay::Viewer { title: "Tool calls & thinking".into(), text, scroll: 0 };
+            return;
+        }
         if let Some(i) = self.selected {
             let e = &self.transcript.entries[i];
             let title = match &e.block {

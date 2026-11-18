@@ -79,6 +79,8 @@ pub struct Entry {
     /// Bumped on every content change (cache key).
     pub rev: u64,
     pub cache: std::cell::RefCell<Option<RenderCache>>,
+    /// Compact mode: whether the group this entry anchors is expanded.
+    pub group_open: bool,
 }
 
 #[allow(dead_code)]
@@ -97,7 +99,7 @@ impl Entry {
             Block::Tool(_) => Fold::Collapsed,
             _ => Fold::Expanded,
         };
-        Entry { block, time: Local::now(), fold, rev: 0, cache: Default::default() }
+        Entry { block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false }
     }
 
     pub fn touch(&mut self) {
@@ -426,6 +428,48 @@ impl Transcript {
         }
     }
 
+    /// Compact-mode groups: maximal runs of visible tool calls and thinking
+    /// blocks with at least two members, as (first member, last member + 1).
+    /// Hidden thinking blocks neither count nor break a run.
+    pub fn groups(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut run: Option<(usize, usize, usize)> = None; // (first, last, count)
+        for (i, e) in self.entries.iter().enumerate() {
+            let thought = matches!(e.block, Block::Thought { .. });
+            if thought && !self.show_thinking {
+                continue;
+            }
+            if thought || matches!(e.block, Block::Tool(_)) {
+                run = Some(match run {
+                    Some((first, _, n)) => (first, i, n + 1),
+                    None => (i, i, 1),
+                });
+            } else if let Some((first, last, n)) = run.take() {
+                if n >= 2 {
+                    out.push((first, last + 1));
+                }
+            }
+        }
+        if let Some((first, last, n)) = run {
+            if n >= 2 {
+                out.push((first, last + 1));
+            }
+        }
+        out
+    }
+
+    /// Members of a group that are actually shown (skips hidden thinking).
+    pub fn group_members(&self, (start, end): (usize, usize)) -> Vec<&Entry> {
+        self.entries[start..end]
+            .iter()
+            .filter(|e| match e.block {
+                Block::Thought { .. } => self.show_thinking,
+                Block::Tool(_) => true,
+                _ => false,
+            })
+            .collect()
+    }
+
     pub fn begin_turn(&mut self) {
         self.last_activity = Instant::now();
         self.plan_entry = None;
@@ -717,6 +761,29 @@ fn merge_tool_fields(t: &mut ToolCall, u: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn groups_runs_of_tools_and_thoughts() {
+        let mut t = Transcript::new();
+        let mut s = Session::default();
+        let thought = |text: &str| json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":text}});
+        let msg = |text: &str| json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}});
+        let tool = |id: &str| json!({"sessionUpdate":"tool_call","toolCallId":id,"title":"Read a.txt","kind":"read"});
+        t.push(Block::User { text: "go".into(), queued: false, tag: None }); // 0
+        t.apply_update(&mut s, &thought("plan")); // 1
+        t.apply_update(&mut s, &tool("a")); // 2
+        t.apply_update(&mut s, &tool("b")); // 3
+        t.apply_update(&mut s, &msg("Halfway.")); // 4
+        t.apply_update(&mut s, &tool("c")); // 5 (alone: not grouped)
+        t.apply_update(&mut s, &msg("Then")); // 6
+        t.apply_update(&mut s, &thought("x")); // 7
+        t.apply_update(&mut s, &tool("d")); // 8
+        assert_eq!(t.groups(), vec![(1, 4), (7, 9)]);
+        // With thinking hidden, the second run is a lone tool and the first starts at the tool.
+        t.show_thinking = false;
+        assert_eq!(t.groups(), vec![(2, 4)]);
+        assert_eq!(t.group_members((1, 4)).len(), 2);
+    }
 
     #[test]
     fn chunks_merge_and_tools_update() {

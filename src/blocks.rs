@@ -272,6 +272,100 @@ fn tool_label(t: &ToolCall, th: &Theme) -> Vec<Span<'static>> {
     v
 }
 
+/// One summary line for a compact-mode group:
+/// `◆ 4 tools · 2 thoughts · 3 edits +12 -3  8s` (plus live activity).
+pub fn group_summary(members: &[&Entry], ctx: &Ctx, open: bool) -> Line<'static> {
+    let th = ctx.theme;
+    let (mut tools, mut thoughts, mut edits, mut failed) = (0usize, 0usize, 0usize, 0usize);
+    let (mut ins, mut del) = (0usize, 0usize);
+    let mut first: Option<std::time::Instant> = None;
+    let mut last_end: Option<std::time::Instant> = None;
+    let mut live: Option<Vec<Span<'static>>> = None;
+    for e in members {
+        let (start, dur) = match &e.block {
+            Block::Thought { started, ended, .. } => {
+                thoughts += 1;
+                if ended.is_none() {
+                    live = Some(vec![Span::styled("Thinking…", th.muted())]);
+                }
+                (*started, *ended)
+            }
+            Block::Tool(t) => {
+                let counts = diff_counts(t);
+                if matches!(t.kind.as_str(), "edit" | "delete" | "move") || counts.is_some() {
+                    edits += 1;
+                } else {
+                    tools += 1;
+                }
+                if let Some((i, d)) = counts {
+                    ins += i;
+                    del += d;
+                }
+                if t.status == ToolStatus::Failed {
+                    failed += 1;
+                }
+                if matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
+                    live = Some(tool_label(t, th));
+                }
+                (t.started, t.ended)
+            }
+            _ => continue,
+        };
+        first = Some(first.map_or(start, |f| f.min(start)));
+        let end = dur.map(|d| start + d).unwrap_or_else(std::time::Instant::now);
+        last_end = Some(last_end.map_or(end, |l| l.max(end)));
+    }
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if tools > 0 {
+        parts.push(plural(tools, "tool", "tools"));
+    }
+    if thoughts > 0 {
+        parts.push(plural(thoughts, "thought", "thoughts"));
+    }
+    if edits > 0 {
+        parts.push(plural(edits, "edit", "edits"));
+    }
+    let mut spans = if open {
+        vec![Span::styled("▾ ", Style::default().fg(blend(th.bg, th.accent, 0.7)))]
+    } else {
+        vec![bullet(th, ctx.tick, live.is_some(), false, th.accent)]
+    };
+    spans.push(Span::styled(parts.join(" · "), if open { th.muted() } else { th.secondary() }));
+    if ins + del > 0 {
+        spans.push(Span::styled(format!(" +{ins}"), Style::default().fg(th.diff_ins_fg)));
+        spans.push(Span::styled(format!(" -{del}"), Style::default().fg(th.diff_del_fg)));
+    }
+    if let (Some(f), Some(l)) = (first, last_end) {
+        let d = l.saturating_duration_since(f);
+        if d.as_secs_f64() >= 1.0 {
+            spans.push(Span::styled(format!("  {}", human_duration(d)), th.dim()));
+        }
+    }
+    if failed > 0 {
+        spans.push(Span::styled(format!("  {failed} failed"), Style::default().fg(th.error)));
+    }
+    if let Some(activity) = live.filter(|_| !open) {
+        let used: usize = spans.iter().map(|s| crate::text::width(&s.content)).sum();
+        let budget = ctx.width.saturating_sub(used + 4);
+        if budget > 8 {
+            spans.push(Span::styled("  ", th.dim()));
+            let mut left = budget;
+            for mut s in activity {
+                let w = crate::text::width(&s.content);
+                if w > left {
+                    s.content = truncate(&s.content, left).into();
+                    spans.push(s);
+                    break;
+                }
+                left -= w;
+                spans.push(s);
+            }
+        }
+    }
+    Line::from(spans)
+}
+
 fn diff_counts(t: &ToolCall) -> Option<(usize, usize)> {
     let mut ins = 0;
     let mut del = 0;

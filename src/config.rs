@@ -51,6 +51,9 @@ pub struct UiConfig {
     /// Expand thinking blocks by default.
     pub expand_thinking: bool,
     pub animations: bool,
+    /// Compact layout: runs of tool calls and thinking collapse into one
+    /// summary line between responses (Ctrl+G or /compact-mode toggles).
+    pub compact: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,6 +87,7 @@ impl Default for UiConfig {
             show_thinking: true,
             expand_thinking: false,
             animations: true,
+            compact: false,
         }
     }
 }

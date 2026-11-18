@@ -167,6 +167,15 @@ fn meta_for(entry: &Entry) -> (bool, usize) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Entry,
+    /// A collapsed compact-mode group (one summary line, selectable).
+    Group,
+    /// The header line above an expanded group (click to collapse).
+    GroupHeader,
+}
+
 fn compact(b: &Block) -> bool {
     matches!(b, Block::Tool(_) | Block::Thought { .. })
 }
@@ -179,13 +188,38 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
     let show_ts = app.config.ui.show_timestamps;
     let tick = app.tick;
 
-    // Gather (entry index, gap_before, lines, band, header_rows)
-    let mut items: Vec<(usize, usize, Rc<Vec<Line<'static>>>, bool, usize)> = Vec::new();
+    // Gather (entry index, gap_before, lines, band, header_rows, kind)
+    let mut items: Vec<(usize, usize, Rc<Vec<Line<'static>>>, bool, usize, ItemKind)> = Vec::new();
     let mut prev: Option<&Block> = None;
     let mut total = 0usize;
+    let groups = if app.config.ui.compact { app.transcript.groups() } else { vec![] };
+    let mut gi = 0;
+    let mut skip_until = 0;
     for (i, e) in app.transcript.entries.iter().enumerate() {
+        if i < skip_until {
+            continue;
+        }
         if !app.transcript.show_thinking && matches!(e.block, Block::Thought { .. }) {
             continue;
+        }
+        while gi < groups.len() && groups[gi].1 <= i {
+            gi += 1;
+        }
+        let mut first_in_open_group = false;
+        if let Some(&(s, end)) = groups.get(gi).filter(|g| g.0 == i) {
+            let open = e.group_open;
+            let members = app.transcript.group_members((s, end));
+            let ctx = blocks::Ctx { theme: th, width: content_w as usize, tick, selected: false };
+            let lines = Rc::new(vec![blocks::group_summary(&members, &ctx, open)]);
+            let gap = if prev.is_none() { 0 } else { 1 };
+            total += gap + 1;
+            items.push((i, gap, lines, false, 1, if open { ItemKind::GroupHeader } else { ItemKind::Group }));
+            prev = Some(&e.block);
+            if !open {
+                skip_until = end;
+                continue;
+            }
+            first_in_open_group = true;
         }
         let (lines, band, hdr) = entry_lines(e, content_w, th, tick, show_ts);
         if lines.is_empty() {
@@ -193,12 +227,13 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
         }
         let gap = match prev {
             None => 0,
+            _ if first_in_open_group => 0,
             Some(p) if compact(p) && compact(&e.block) && e.fold == Fold::Collapsed => 0,
             Some(p) if compact(p) && compact(&e.block) => 1,
             _ => 1,
         };
         total += gap + lines.len();
-        items.push((i, gap, lines, band, hdr));
+        items.push((i, gap, lines, band, hdr, ItemKind::Entry));
         prev = Some(&e.block);
     }
     let view_h = r.height as usize;
@@ -210,9 +245,9 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
         app.ensure_selected_visible = false;
         if let Some(sel) = app.selected {
             let mut y = 0usize;
-            for (i, gap, lines, _, _) in &items {
+            for (i, gap, lines, _, _, kind) in &items {
                 y += gap;
-                if *i == sel {
+                if *i == sel && *kind != ItemKind::GroupHeader {
                     let top = total.saturating_sub(view_h + app.scroll);
                     let bottom = top + view_h;
                     let (s, e) = (y, y + lines.len());
@@ -239,7 +274,7 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
     let x0 = r.x;
     let cx = r.x + 2;
     let mut y = 0usize;
-    for (idx, gap, lines, band, hdr) in &items {
+    for (idx, gap, lines, band, hdr, kind) in &items {
         y += gap;
         let start = y;
         let end = y + lines.len();
@@ -248,11 +283,29 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             continue;
         }
         let entry = &app.transcript.entries[*idx];
-        let selected = app.selected == Some(*idx) && app.focus == Focus::Scrollback;
+        let selected = app.selected == Some(*idx) && app.focus == Focus::Scrollback && *kind != ItemKind::GroupHeader;
         let first_vis = start.max(top);
         let last_vis = end.min(top + view_h);
         let sy0 = r.y + (first_vis - top) as u16;
         let sy1 = r.y + (last_vis - top) as u16;
+        if *kind == ItemKind::GroupHeader {
+            layout.group_rows.push((sy0, *idx));
+            buf.set_line(cx, sy0, &lines[0], content_w);
+            continue;
+        }
+        if *kind == ItemKind::Group {
+            layout.entry_rows.push((sy0, sy1, *idx, *hdr, first_vis - start));
+            buf.set_line(cx, sy0, &lines[0], content_w);
+            if selected {
+                buf.set_string(x0, sy0, SELECT_BAR, Style::default().fg(th.accent));
+                if let Some(cell) = buf.cell_mut((cx, sy0)) {
+                    if cell.symbol() == DIAMOND {
+                        cell.set_symbol("›").set_fg(th.accent);
+                    }
+                }
+            }
+            continue;
+        }
         layout.entry_rows.push((sy0, sy1, *idx, *hdr, first_vis - start));
         for row in first_vis..last_vis {
             let sy = r.y + (row - top) as u16;
@@ -687,14 +740,6 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     } else {
         vec![("Shift+Tab", "mode"), ("Ctrl+c", "cancel"), ("Ctrl+.", "shortcuts")]
     };
-    let mut left = hint_line(th, &hints);
-    // Quick Peek: describe the selected tool's file.
-    if app.focus == Focus::Scrollback {
-        if let Some(p) = app.selected_path() {
-            left.spans.insert(0, Span::styled(format!("{}   ", crate::peek::describe(&p)), th.secondary()));
-        }
-    }
-
     // Right side: subscription meter, then the narrator toggle.
     let mut right: Vec<Span> = Vec::new();
     let windows = crate::usage::meter_windows(&app.limits);
@@ -720,13 +765,29 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         ("⏸ narrator off", th.dim())
     };
     right.push(Span::styled(label, style));
-    let right_w = right.iter().map(|s| crate::text::width(&s.content)).sum::<usize>() as u16;
+    let mut right_w = right.iter().map(|s| crate::text::width(&s.content)).sum::<usize>() as u16;
     let label_w = crate::text::width(label) as u16;
     if right_w + 10 < r.width {
         layout.narrator_button = Some(Rect { x: r.x + r.width - label_w, y: r.y, width: label_w, height: 1 });
         f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), r);
+    } else {
+        right_w = 0;
     }
+
+    // Left side: drop whole hints from the end rather than cutting one off mid-word.
     let left_w = r.width.saturating_sub(1 + right_w + 2);
+    let peek = if app.focus == Focus::Scrollback { app.selected_path().map(|p| crate::peek::describe(&p)) } else { None };
+    let mut hints = hints;
+    let left = loop {
+        let mut line = hint_line(th, &hints);
+        if let Some(d) = &peek {
+            line.spans.insert(0, Span::styled(format!("{d}   "), th.secondary()));
+        }
+        if line_width(&line) <= left_w as usize || hints.len() <= 1 {
+            break line;
+        }
+        hints.pop();
+    };
     f.render_widget(Paragraph::new(left), Rect { x: r.x + 1, width: left_w, ..r });
 }
 
@@ -914,6 +975,7 @@ fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
         ("Global", &[
             ("Ctrl+E", "expand / collapse thinking"),
             ("Ctrl+O", "expand / collapse all blocks"),
+            ("Ctrl+G", "compact layout: group tools & thinking"),
             ("Ctrl+L", "redraw"),
             ("Ctrl+. / F1", "this help"),
             ("Shift+drag", "native text selection"),
@@ -961,4 +1023,55 @@ fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let s = (*scroll).min(max);
     let vis: Vec<Line> = lines.into_iter().skip(s).take(inner.height as usize).collect();
     f.render_widget(Paragraph::new(vis), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::SessionKind;
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::json;
+
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compact_mode_groups_tools_between_responses() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.ui.show_timestamps = false;
+        let mut app = App::new(cfg, std::env::temp_dir(), tx, SessionKind::New);
+        app.transcript.entries.clear();
+        let mut s = crate::model::Session::default();
+        let up = |v: serde_json::Value, app: &mut App, s: &mut crate::model::Session| {
+            app.transcript.apply_update(s, &v);
+        };
+        app.transcript.push(Block::User { text: "add div".into(), queued: false, tag: None });
+        up(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"think"}}), &mut app, &mut s);
+        up(json!({"sessionUpdate":"tool_call","toolCallId":"1","title":"Read calc.py","kind":"read","status":"completed"}), &mut app, &mut s);
+        up(json!({"sessionUpdate":"tool_call","toolCallId":"2","title":"Write calc.py","kind":"edit","status":"completed",
+            "content":[{"type":"diff","path":"calc.py","oldText":"a\n","newText":"a\nb\nc\n"}]}), &mut app, &mut s);
+        up(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I added div."}}), &mut app, &mut s);
+
+        let full = screen(&mut app, 70, 22);
+        app.config.ui.compact = true;
+        let compact = screen(&mut app, 70, 22);
+        println!("--- normal ---\n{full}\n--- compact ---\n{compact}");
+        assert!(compact.contains("1 tool · 1 thought · 1 edit +2 -0"), "{compact}");
+        assert!(!compact.contains("Read calc.py"));
+
+        app.transcript.entries[1].group_open = true;
+        let open = screen(&mut app, 70, 22);
+        println!("--- group expanded ---\n{open}");
+        assert!(open.contains("▾ 1 tool · 1 thought · 1 edit") && open.contains("Read calc.py"), "{open}");
+    }
 }
