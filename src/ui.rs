@@ -14,6 +14,7 @@ use crate::app::{App, Completion, Conn, FieldKind, Focus, LayoutInfo, Overlay};
 use crate::blocks::{self, BRAILLE, DIAMOND, DOT_SPINNER, PROMPT_ARROW, RAIL, SELECT_BAR};
 use crate::model::{Block, Entry, Fold, RenderCache, ToolStatus, short_mode};
 use crate::text::{human_duration, human_tokens, line_width, sanitize, truncate, truncate_left, wrap_spans};
+use crate::usage::until;
 use crate::theme::{Theme, blend, wave};
 
 
@@ -66,7 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         layout.card_area = Some(card);
     }
     draw_prompt(f, app, &th, prompt, prompt_inner_w);
-    draw_footer(f, app, &th, footer);
+    draw_footer(f, app, &th, footer, &mut layout);
     draw_completion(f, app, &th, prompt);
 
     match &app.overlay {
@@ -366,6 +367,10 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
             Span::styled(activity, th.secondary()),
             Span::styled(format!(" {}", human_duration_short(elapsed)), th.muted()),
         ];
+        if let Some(tag) = &app.turn_tag {
+            left.push(Span::styled(format!(" · {tag}"), th.accent()));
+        }
+        right.extend(context_meter(app, th));
         right.push(Span::styled(
             format!("{} ⇣{} ", human_duration_short(elapsed), human_tokens((app.turn_chars / 4) as u64)),
             th.muted(),
@@ -373,13 +378,42 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         right.push(Span::styled("[stop]", Style::default().fg(th.gray_bright)));
         let stop_x = r.x + r.width - 6;
         layout.stop_button = Some(Rect { x: stop_x, y: r.y, width: 6, height: 1 });
-    } else if let Some((d, chars)) = app.last_turn {
-        if app.conn == Conn::Ready {
-            right.push(Span::styled(format!("{} ⇣{}", human_duration_short(d), human_tokens((chars / 4) as u64)), th.dim()));
+    } else if app.conn == Conn::Ready {
+        if let Some((d, chars)) = app.last_turn {
+            right.push(Span::styled(human_duration_short(d), th.dim()));
+            if let Some(tag) = &app.turn_tag {
+                right.push(Span::styled(format!(" · {tag}"), Style::default().fg(blend(th.accent, th.bg, 0.35))));
+            }
+            match (&app.turn_tokens, app.config.features.token_meter) {
+                (Some(t), true) => {
+                    right.push(Span::styled("  in ", th.dim()));
+                    right.push(Span::styled(human_tokens(t.input), Style::default().fg(th.info)));
+                    right.push(Span::styled(" · out ", th.dim()));
+                    right.push(Span::styled(human_tokens(t.output), Style::default().fg(th.success)));
+                    if t.cache_read + t.cache_write > 0 {
+                        right.push(Span::styled(" · cache ", th.dim()));
+                        right.push(Span::styled(
+                            format!("{}↺ {}+", human_tokens(t.cache_read), human_tokens(t.cache_write)),
+                            th.muted(),
+                        ));
+                    }
+                    let s = &app.session_tokens;
+                    right.push(Span::styled(
+                        format!("  Σ {} in · {} out", human_tokens(s.input + s.cache_read + s.cache_write), human_tokens(s.output)),
+                        th.dim(),
+                    ));
+                }
+                _ => right.push(Span::styled(format!(" ⇣{}", human_tokens((chars / 4) as u64)), th.dim())),
+            }
             if let Some(c) = app.session.cost {
                 right.push(Span::styled(format!("  ${c:.2}"), th.dim()));
             }
         }
+        let ctx = context_meter(app, th);
+        if !ctx.is_empty() && !right.is_empty() {
+            right.push(Span::styled("  ", th.dim()));
+        }
+        right.extend(ctx);
     }
     if !app.queue.is_empty() {
         left.push(Span::styled(format!("  · {} queued", app.queue.len()), th.muted()));
@@ -394,6 +428,23 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     }
     f.render_widget(Paragraph::new(Line::from(left)), Rect { x: r.x + 1, width: r.width.saturating_sub(1), ..r });
     f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), r);
+}
+
+/// "context 23%": dim with room to spare, yellow from 50% (time to /compact),
+/// red from 75% (consider a new session).
+fn context_meter(app: &App, th: &Theme) -> Vec<Span<'static>> {
+    if app.session.size == 0 || app.session.used == 0 {
+        return vec![];
+    }
+    let pct = app.session.used as f64 * 100.0 / app.session.size as f64;
+    let style = if pct >= 75.0 {
+        Style::default().fg(th.error)
+    } else if pct >= 50.0 {
+        Style::default().fg(th.warning)
+    } else {
+        th.dim()
+    };
+    vec![Span::styled(format!("context {pct:.0}% "), style)]
 }
 
 fn human_duration_short(d: Duration) -> String {
@@ -620,13 +671,15 @@ fn hint_line(th: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut LayoutInfo) {
     let hints: Vec<(&str, &str)> = if !app.permissions.is_empty() {
         vec![("↑↓", "select"), ("Enter", "confirm"), ("1-9", "pick"), ("Esc", "deny"), ("Ctrl+c", "cancel turn")]
     } else if app.question.is_some() {
         vec![("↑↓", "select"), ("Space", "toggle"), ("Enter", "confirm"), ("Esc", "dismiss")]
     } else if app.completion.is_some() {
         vec![("↑↓", "select"), ("Tab", "complete"), ("Enter", "accept"), ("Esc", "close")]
+    } else if app.focus == Focus::Scrollback && app.selected_path().is_some() {
+        vec![("o", "open"), ("r", "reveal"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
     } else if app.focus == Focus::Scrollback {
         vec![("↑↓", "select"), ("←→", "fold"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
     } else if app.responding {
@@ -634,7 +687,47 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect) {
     } else {
         vec![("Shift+Tab", "mode"), ("Ctrl+c", "cancel"), ("Ctrl+.", "shortcuts")]
     };
-    f.render_widget(Paragraph::new(hint_line(th, &hints)), Rect { x: r.x + 1, width: r.width.saturating_sub(1), ..r });
+    let mut left = hint_line(th, &hints);
+    // Quick Peek: describe the selected tool's file.
+    if app.focus == Focus::Scrollback {
+        if let Some(p) = app.selected_path() {
+            left.spans.insert(0, Span::styled(format!("{}   ", crate::peek::describe(&p)), th.secondary()));
+        }
+    }
+
+    // Right side: subscription meter, then the narrator toggle.
+    let mut right: Vec<Span> = Vec::new();
+    let windows = crate::usage::meter_windows(&app.limits);
+    if app.config.features.sub_meter && !windows.is_empty() {
+        let w = windows[(app.tick as usize / 120) % windows.len()];
+        let cells = 10usize;
+        let filled = ((w.percent / 100.0) * cells as f64).round().clamp(0.0, cells as f64) as usize;
+        let color = if w.percent >= 90.0 { th.error } else if w.percent >= 70.0 { th.warning } else { th.accent };
+        right.push(Span::styled(format!("{} ", w.label), th.muted()));
+        right.push(Span::styled("▰".repeat(filled), Style::default().fg(color)));
+        right.push(Span::styled("▱".repeat(cells - filled), th.dim()));
+        right.push(Span::styled(format!(" {:.0}%", w.percent), Style::default().fg(th.text_secondary)));
+        if let Some(t) = w.resets {
+            right.push(Span::styled(format!(" · {}", until(t, chrono::Local::now())), th.dim()));
+        }
+        right.push(Span::styled("   ", th.dim()));
+    }
+    let (label, style) = if app.narrating {
+        ("⏹ narrating", Style::default().fg(th.accent))
+    } else if app.config.features.narrator {
+        ("▶ narrator on", th.secondary())
+    } else {
+        ("⏸ narrator off", th.dim())
+    };
+    right.push(Span::styled(label, style));
+    let right_w = right.iter().map(|s| crate::text::width(&s.content)).sum::<usize>() as u16;
+    let label_w = crate::text::width(label) as u16;
+    if right_w + 10 < r.width {
+        layout.narrator_button = Some(Rect { x: r.x + r.width - label_w, y: r.y, width: label_w, height: 1 });
+        f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), r);
+    }
+    let left_w = r.width.saturating_sub(1 + right_w + 2);
+    f.render_widget(Paragraph::new(left), Rect { x: r.x + 1, width: left_w, ..r });
 }
 
 // ---------------------------------------------------------------- completion popup
@@ -805,6 +898,8 @@ fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
             ("Ctrl+C", "stop response · clear · quit (×2)"),
             ("Esc Esc", "clear the prompt"),
             ("/  @", "commands · mention files"),
+            ("_ prompt", "run this turn on Haiku"),
+            ("+ prompt", "run this turn at max effort"),
         ]),
         ("Scrollback", &[
             ("↑ / ↓", "select entry"),
@@ -812,6 +907,7 @@ fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
             ("← / →", "collapse / expand"),
             ("Enter", "open in viewer"),
             ("y / Y", "copy content / command"),
+            ("o / r", "open / reveal the entry's file"),
             ("g / G", "top / bottom"),
             ("PgUp / PgDn, wheel", "scroll"),
         ]),
@@ -821,6 +917,12 @@ fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
             ("Ctrl+L", "redraw"),
             ("Ctrl+. / F1", "this help"),
             ("Shift+drag", "native text selection"),
+        ]),
+        ("Commands", &[
+            ("/commit", "Conventional Commits on Haiku"),
+            ("/timeline · /undo · /redo", "Time Machine file snapshots"),
+            ("/after <task>", "queue a task for when Claude finishes"),
+            ("/narrator", "read each turn's summary aloud"),
         ]),
     ];
     let mut lines = Vec::new();

@@ -55,7 +55,8 @@ pub enum Level {
 #[derive(Clone, Debug)]
 pub enum Block {
     Welcome,
-    User { text: String, queued: bool },
+    /// `tag` notes a per-turn override, e.g. "haiku" or "max effort".
+    User { text: String, queued: bool, tag: Option<String> },
     Agent { text: String },
     Thought { text: String, started: Instant, ended: Option<Duration> },
     Tool(ToolCall),
@@ -383,6 +384,8 @@ pub struct Transcript {
     pub last_activity: Instant,
     pub show_thinking: bool,
     pub expand_thinking: bool,
+    /// Replaying a `/usage` exchange blush ran in the background: skip it.
+    pub skipping_usage: bool,
 }
 
 impl Transcript {
@@ -394,6 +397,7 @@ impl Transcript {
             last_activity: Instant::now(),
             show_thinking: true,
             expand_thinking: false,
+            skipping_usage: false,
         }
     }
 
@@ -425,6 +429,7 @@ impl Transcript {
     pub fn begin_turn(&mut self) {
         self.last_activity = Instant::now();
         self.plan_entry = None;
+        self.skipping_usage = false;
     }
 
     /// Mark any still-running tools as finished (turn ended / cancelled).
@@ -474,6 +479,15 @@ impl Transcript {
         if !matches!(kind, "agent_thought_chunk" | "usage_update" | "available_commands_update" | "session_info_update") {
             self.last_activity = Instant::now();
         }
+        if kind == "user_message_chunk" {
+            let t = u.get("content").and_then(content_text).unwrap_or_default();
+            self.skipping_usage = t.trim() == "/usage";
+            if self.skipping_usage {
+                return fx;
+            }
+        } else if self.skipping_usage && matches!(kind, "agent_message_chunk" | "agent_thought_chunk") {
+            return fx;
+        }
         match kind {
             "agent_message_chunk" => {
                 if let Some(t) = u.get("content").and_then(content_text) {
@@ -491,7 +505,7 @@ impl Transcript {
                         text.push_str(&t);
                         *rev += 1;
                     } else {
-                        self.push(Block::User { text: t, queued: false });
+                        self.push(Block::User { text: t, queued: false, tag: None });
                     }
                 }
             }

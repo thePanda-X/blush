@@ -12,7 +12,7 @@ Grok Build's look and feel, with Claude Code doing the work underneath, connecte
 [![Platforms](https://img.shields.io/badge/platforms-windows%20·%20macos%20·%20linux-f2b8cf?style=flat-square&labelColor=1b1b1f)](#install)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2b8cf?style=flat-square&labelColor=1b1b1f)](#license)
 
-[Install](#install) · [Usage](#usage) · [Keys](#keyboard--mouse) · [Commands](#slash-commands) · [Themes](#themes) · [Config](#configuration) · [How it works](#how-it-works)
+[Install](#install) · [Usage](#usage) · [Keys](#keyboard--mouse) · [Commands](#slash-commands) · [Power tools](#power-tools) · [Themes](#themes) · [Config](#configuration) · [How it works](#how-it-works)
 
 </div>
 
@@ -50,6 +50,9 @@ Grok Build's look and feel, with Claude Code doing the work underneath, connecte
 - **The mouse works.** Scroll with the wheel, click a block to select it, and click its header to fold it.
 - **Gets out of your way.** Sessions start in `bypassPermissions` mode (shown as
   `always-approve`). Press `Shift+Tab` to switch to a stricter mode whenever you like.
+- **Power tools built in.** A Time Machine that snapshots your files after every turn, `/commit`
+  into Conventional Commits, meters for your subscription, context, and tokens, a spoken summary
+  of each turn, and one-character prefixes that run a single turn on Haiku or at max effort.
 - **Headless mode.** `blush -p "…"` streams the answer to stdout, so you can use it in scripts and pipes.
 - **Five themes.** The default is a grey `#1b1b1f` canvas with a soft pink `#f2b8cf` accent.
 - **Cross-platform.** It runs on Windows, macOS, and Linux. On Windows it launches the adapter
@@ -128,6 +131,7 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `Ctrl+C` | First press stops the response, the next clears the prompt, and pressing twice on an empty prompt quits |
 | `Tab` / `↑` on an empty prompt | Move focus to the scrollback |
 | `↑` `↓` · `←` `→` · `Enter` · `y` | In the scrollback: select an entry, fold or unfold it, open it in the viewer, copy it |
+| `o` / `r` | In the scrollback: open the selected tool's file, or reveal it in Explorer / Finder |
 | `Shift+←` / `Shift+→` | Jump between turns |
 | `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks |
 | `PgUp` / `PgDn`, mouse wheel | Scroll |
@@ -154,6 +158,10 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `/login` | Run `claude auth login` without leaving blush |
 | `/config` | Show where the config file is |
 | `/shortcuts` (`/help`, `/keys`) | Show the shortcut overlay |
+| `/commit` | Commit your changes as Conventional Commits, on Haiku |
+| `/timeline` · `/undo` · `/redo` | Browse and restore Time Machine snapshots |
+| `/after <task>` | Queue a task to run once Claude finishes |
+| `/narrator` | Turn spoken turn summaries on or off |
 | `/quit` (`/exit`, `/q`) | Quit |
 
 Every command Claude Code advertises works too, including `/compact`, `/review`, and your own
@@ -161,6 +169,74 @@ custom commands.
 
 Type **`@path`** to fuzzy-search files in the project. The file you pick is attached to your prompt
 as a resource link.
+
+## Power tools
+
+### Per-turn model and effort
+
+Start a prompt with **`_`** to run just that turn on Haiku, or with **`+`** to run it at max effort.
+You can combine them (`_+`). The override shows on the prompt, on the spinner, and next to the
+turn's stats, and the session's own model and effort come back as soon as the turn ends.
+
+```
+_ rename these variables to snake_case
++ find the race condition in the scheduler
+```
+
+`__init__.py …` and `+1 …` are left alone, so prompts that happen to start with those characters still work.
+
+### Time Machine
+
+blush takes a git snapshot of your working tree before the first turn and after every turn that
+changes files. That includes changes made through Bash, not just through edit tools. Snapshots go
+into a private index (`.git/blush-timeline.index`) and `refs/blush/timeline/*`, so your staging
+area, `HEAD`, and branches are never touched.
+
+- `/timeline` lists every state: `◉` is where you are, `●` is earlier, and `○` is undone.
+  Press `→` to preview a snapshot's diff and `Enter` to restore it.
+- `/undo` and `/redo` step back and forth one snapshot at a time.
+- Before any jump, blush snapshots your current files, so you never lose edits you haven't saved.
+
+The Time Machine restores files, not the conversation: Claude still remembers the turns you undid.
+It needs the working directory to be inside a git repository.
+
+### `/commit`
+
+`/commit` asks how to finish: **commit and push** (recommended), **commit only**, or **commit on a
+new branch**. Then a Haiku turn reads your diff and splits it into one Conventional Commit per
+logical change on your branch. It won't stage secrets such as `.env` files or keys, and it adds no
+AI attribution. You can skip the menu with `/commit push`, `/commit commit`, or `/commit branch`.
+
+### Meters
+
+| Meter | Where | What it shows |
+|---|---|---|
+| **Context** | Above the prompt, right | How full the context window is. Dim below 50%, yellow from 50% (a good time to `/compact`), red from 75% (consider `/new`). |
+| **Tokens** | Above the prompt, right | The last turn's input, output, and cache reads and writes, plus running totals for the session. |
+| **Subscription** | Footer, right | Your 5-hour and weekly limits, alternating every few seconds, with a bar, the percentage used, and the time until each resets. |
+
+The subscription meter comes from Claude Code's `/usage` command. That command runs locally and
+doesn't call the model. blush runs it quietly after a turn, at most every five minutes, and hides
+those exchanges when you resume a session.
+
+### Narrator
+
+`/narrator`, or a click on the `⏸ narrator off` toggle in the footer, turns on spoken summaries.
+After each turn, blush reads the opening of Claude's final message aloud with your system voice:
+System.Speech on Windows, `say` on macOS, and `spd-say` or `espeak-ng` on Linux. The toggle shows
+`⏹ narrating` while it speaks, and clicking it stops the speech. Sending a new prompt also stops it.
+
+### Quick Peek
+
+Select a tool entry in the scrollback (click it, or `Tab` and then `↑`/`↓`). The footer shows the
+file's name, type, size, and how long ago it was modified. Press `o` to open the file in its
+default app, or `r` to reveal it in Explorer / Finder / your file manager.
+
+### `/after`
+
+`/after <task>` queues a task to run when the current turn finishes, without interrupting it.
+Pressing `Enter` while Claude is responding does the same. `/after` just makes your intent explicit,
+and it accepts the `_` and `+` prefixes.
 
 ## Themes
 
@@ -200,6 +276,12 @@ args = []
 
 [agent.env]                          # extra env for the agent process
 # CLAUDE_CODE_THINKING_DISPLAY = "omitted"
+
+[features]
+narrator = false      # spoken turn summaries (toggle with /narrator)
+sub_meter = true      # 5-hour / weekly subscription meter
+token_meter = true    # per-turn and session token counts
+timeline = true       # Time Machine snapshots after each turn
 ```
 
 > **Bring your own agent.** blush speaks plain ACP, so setting `agent.command` and `agent.args` lets
@@ -240,6 +322,9 @@ default mode instead.
 | [`src/headless.rs`](src/headless.rs) | The one-shot `-p` mode. |
 | [`src/input.rs`](src/input.rs), [`src/files.rs`](src/files.rs) | The prompt editor and `@path` fuzzy file completion. |
 | [`src/theme.rs`](src/theme.rs), [`src/config.rs`](src/config.rs) | Themes, colour overrides, and `config.toml`. |
+| [`src/timeline.rs`](src/timeline.rs) | The Time Machine: snapshots in a private git index, and restores that only touch the paths that changed. |
+| [`src/usage.rs`](src/usage.rs) | Parses `/usage` into the subscription meter, and reads per-turn token usage from prompt responses. |
+| [`src/narrator.rs`](src/narrator.rs), [`src/peek.rs`](src/peek.rs) | Text-to-speech summaries, and opening or revealing files. |
 
 ## Troubleshooting
 

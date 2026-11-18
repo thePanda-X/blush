@@ -39,7 +39,7 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
     let w = ctx.width.max(10);
     match &entry.block {
         Block::Welcome => Rendered { lines: welcome(th, w), band: false, header_rows: 0 },
-        Block::User { text, queued } => {
+        Block::User { text, queued, tag } => {
             let mut lines = vec![Line::default()];
             let arrow_style = if *queued { th.dim() } else { Style::default().fg(th.accent).add_modifier(Modifier::BOLD) };
             let text_style = if *queued { th.muted() } else { Style::default().fg(th.text).add_modifier(Modifier::BOLD) };
@@ -50,8 +50,11 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
                 vec![Span::styled(PROMPT_ARROW, arrow_style)],
                 vec![Span::raw("  ")],
             );
-            if *queued {
-                if let Some(l) = wrapped.last_mut() {
+            if let Some(l) = wrapped.last_mut() {
+                if let Some(tag) = tag {
+                    l.spans.push(Span::styled(format!("  {tag}"), Style::default().fg(blend(th.accent, th.bg, 0.35))));
+                }
+                if *queued {
                     l.spans.push(Span::styled("  queued", Style::default().fg(th.gray_dim).add_modifier(Modifier::ITALIC)));
                 }
             }
@@ -134,12 +137,48 @@ fn bullet(th: &Theme, tick: u64, live: bool, failed: bool, live_color: ratatui::
     Span::styled(format!("{DIAMOND} "), Style::default().fg(color))
 }
 
+const LOGO: [&str; 8] = [
+    " ███████████  ████                     █████     ",
+    "▒▒███▒▒▒▒▒███▒▒███                    ▒▒███      ",
+    " ▒███    ▒███ ▒███  █████ ████  █████  ▒███████  ",
+    " ▒██████████  ▒███ ▒▒███ ▒███  ███▒▒   ▒███▒▒███ ",
+    " ▒███▒▒▒▒▒███ ▒███  ▒███ ▒███ ▒▒█████  ▒███ ▒███ ",
+    " ▒███    ▒███ ▒███  ▒███ ▒███  ▒▒▒▒███ ▒███ ▒███ ",
+    " ███████████  █████ ▒▒████████ ██████  ████ █████",
+    "▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒▒   ▒▒▒▒▒▒▒▒ ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
+];
+const LOGO_SMALL: [&str; 2] = ["█▄▄ █   █ █ █▀ █ █", "█▄█ █▄▄ █▄█ ▄█ █▀█"];
+
+/// One logo row, with solid blocks in `solid` and the `▒` shadow in `shade`.
+fn logo_line(row: &str, solid: Style, shade: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_shade = false;
+    for ch in row.chars() {
+        let is_shade = ch == '▒';
+        if is_shade != run_shade && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), if run_shade { shade } else { solid }));
+        }
+        run_shade = is_shade;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_shade { shade } else { solid }));
+    }
+    Line::from(spans)
+}
+
 fn welcome(th: &Theme, w: usize) -> Vec<Line<'static>> {
-    let logo = ["█▄▄ █   █ █ █▀ █ █", "█▄█ █▄▄ █▄█ ▄█ █▀█"];
     let mut lines = vec![Line::default()];
-    for (i, l) in logo.iter().enumerate() {
-        let c = if i == 0 { th.accent } else { blend(th.accent, th.bg, 0.25) };
-        lines.push(Line::from(vec![Span::styled(l.to_string(), Style::default().fg(c).add_modifier(Modifier::BOLD))]));
+    if w >= crate::text::width(LOGO[0]) {
+        let solid = Style::default().fg(th.accent);
+        let shade = Style::default().fg(blend(th.accent, th.bg, 0.6));
+        lines.extend(LOGO.iter().map(|row| logo_line(row, solid, shade)));
+    } else {
+        for (i, l) in LOGO_SMALL.iter().enumerate() {
+            let c = if i == 0 { th.accent } else { blend(th.accent, th.bg, 0.25) };
+            lines.push(Line::from(vec![Span::styled(l.to_string(), Style::default().fg(c).add_modifier(Modifier::BOLD))]));
+        }
     }
     lines.push(Line::default());
     lines.push(Line::from(vec![

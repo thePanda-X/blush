@@ -17,7 +17,11 @@ use crate::files::{FileIndex, fuzzy_filter, mentioned_paths};
 use crate::input::Input;
 use crate::launcher;
 use crate::model::{Block, Fold, Level, Session, Transcript, s};
+use crate::narrator::Narrator;
 use crate::theme::{THEME_NAMES, Theme};
+use crate::timeline::Timeline;
+use crate::usage::{LimitWindow, Tokens};
+use crate::{narrator, peek};
 
 pub enum AppMsg {
     Acp(Incoming),
@@ -30,6 +34,60 @@ pub enum AppMsg {
     ModeSet(String, Result<Value, RpcError>),
     ConfigSet(Result<Value, RpcError>),
     Sessions(Result<Value, RpcError>),
+    /// Legacy `session/set_model` change made by a per-turn override.
+    LegacyModel(String),
+    /// A background `/usage` fetch for the subscription meter finished.
+    UsageDone(Result<Value, RpcError>),
+    /// A Time Machine snapshot or jump finished: (toast/notice, is_error).
+    Timeline(Option<(String, bool)>),
+}
+
+/// A prompt on its way to the agent, with its per-turn overrides.
+#[derive(Clone, Debug)]
+pub struct Outgoing {
+    pub text: String,
+    /// `_` prefix: run this turn on Haiku.
+    pub haiku: bool,
+    /// `+` prefix: run this turn at max effort.
+    pub max_effort: bool,
+}
+
+impl Outgoing {
+    pub fn plain(text: String) -> Outgoing {
+        Outgoing { text, haiku: false, max_effort: false }
+    }
+
+    /// Parse leading `_` (Haiku) and `+` (max effort) markers.
+    pub fn parse(raw: &str) -> Outgoing {
+        let mut out = Outgoing::plain(String::new());
+        let mut rest = raw;
+        loop {
+            if let Some(r) = rest.strip_prefix('_').filter(|r| !r.starts_with('_')) {
+                out.haiku = true;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix('+').filter(|r| !r.starts_with(|c: char| c.is_ascii_digit() || c == '+')) {
+                out.max_effort = true;
+                rest = r;
+            } else {
+                break;
+            }
+        }
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return Outgoing::plain(raw.to_string());
+        }
+        out.text = rest.to_string();
+        out
+    }
+
+    pub fn tag(&self) -> Option<String> {
+        match (self.haiku, self.max_effort) {
+            (true, true) => Some("haiku · max effort".into()),
+            (true, false) => Some("haiku".into()),
+            (false, true) => Some("max effort".into()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +119,8 @@ pub enum PickerKind {
     Theme,
     Resume,
     Option(String),
+    Commit,
+    Timeline,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +202,7 @@ pub struct LayoutInfo {
     /// (screen y start, screen y end exclusive, entry index, header rows, first rendered row index)
     pub entry_rows: Vec<(u16, u16, usize, usize, usize)>,
     pub stop_button: Option<Rect>,
+    pub narrator_button: Option<Rect>,
     pub total_lines: usize,
     pub view_height: usize,
     pub card_area: Option<Rect>,
@@ -179,7 +240,26 @@ pub struct App {
     pub turn_started: Option<Instant>,
     pub turn_chars: usize,
     pub last_turn: Option<(Duration, usize)>,
-    pub queue: VecDeque<(String, usize)>,
+    pub queue: VecDeque<(Outgoing, usize)>,
+    /// Override tag of the running turn ("haiku", "max effort").
+    pub turn_tag: Option<String>,
+    /// Text of the prompt that started the running turn.
+    pub turn_prompt: String,
+
+    pub narrator: Narrator,
+    /// Whether the narrator was speaking at the last poll.
+    pub narrating: bool,
+    pub timeline: Arc<std::sync::Mutex<Timeline>>,
+    /// A snapshot or jump is running; prompts wait for it.
+    pub timeline_busy: bool,
+    /// Buffer of a background `/usage` turn while it runs.
+    pub usage_fetch: Option<String>,
+    pub usage_fetched: Option<Instant>,
+    pub usage_failures: u8,
+    pub limits: Vec<LimitWindow>,
+    pub turn_tokens: Option<Tokens>,
+    pub session_tokens: Tokens,
+    pub turns_done: usize,
 
     pub selected: Option<usize>,
     /// Lines scrolled up from the bottom.
@@ -218,6 +298,12 @@ pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("theme", "Change the color theme"),
     ("copy", "Copy the last response to the clipboard"),
     ("export", "Export the conversation to Markdown"),
+    ("commit", "Commit changes as Conventional Commits (runs on Haiku)"),
+    ("timeline", "Time Machine: browse and restore file snapshots"),
+    ("undo", "Restore files to the previous snapshot"),
+    ("redo", "Restore files to the next snapshot"),
+    ("after", "Queue a task to run when Claude finishes"),
+    ("narrator", "Read a summary of each turn aloud"),
     ("context", "Show context window usage"),
     ("session-info", "Show session details"),
     ("thinking", "Show / hide thinking blocks"),
@@ -263,6 +349,19 @@ impl App {
             turn_chars: 0,
             last_turn: None,
             queue: VecDeque::new(),
+            turn_tag: None,
+            turn_prompt: String::new(),
+            narrator: Narrator::default(),
+            narrating: false,
+            timeline: Arc::new(std::sync::Mutex::new(Timeline::default())),
+            timeline_busy: false,
+            usage_fetch: None,
+            usage_fetched: None,
+            usage_failures: 0,
+            limits: Vec::new(),
+            turn_tokens: None,
+            session_tokens: Tokens::default(),
+            turns_done: 0,
             selected: None,
             scroll: 0,
             follow: true,
@@ -289,8 +388,17 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// Track the narrator finishing on its own; true when the footer needs a redraw.
+    pub fn poll_narrator(&mut self) -> bool {
+        let now = self.narrator.speaking();
+        let changed = now != self.narrating;
+        self.narrating = now;
+        changed
+    }
+
     pub fn animating(&self) -> bool {
         self.responding
+            || self.timeline_busy
             || matches!(self.conn, Conn::Starting(_))
             || self.transcript.entries.iter().rev().take(30).any(|e| e.is_live())
     }
@@ -597,8 +705,66 @@ impl App {
                 }
                 Err(e) => self.transcript.notice(Level::Error, format!("Couldn't list sessions: {e}")),
             },
+            AppMsg::LegacyModel(m) => self.session.model = m,
+            AppMsg::UsageDone(res) => {
+                let buf = self.usage_fetch.take().unwrap_or_default();
+                let limits = crate::usage::parse_limits(&buf);
+                if res.is_ok() && !limits.is_empty() {
+                    self.limits = limits;
+                    self.usage_failures = 0;
+                } else {
+                    self.usage_failures += 1;
+                }
+                self.usage_fetched = Some(Instant::now());
+                self.pump_queue();
+            }
+            AppMsg::Timeline(msg) => {
+                self.timeline_busy = false;
+                match msg {
+                    Some((m, true)) => self.transcript.notice(Level::Error, m),
+                    Some((m, false)) => self.toast(m),
+                    None => {}
+                }
+                self.after_turn_housekeeping();
+            }
             AppMsg::Acp(inc) => self.on_incoming(inc).await,
         }
+    }
+
+    /// Anything other than a user turn that must finish before the next prompt.
+    pub fn busy(&self) -> bool {
+        self.responding || self.timeline_busy || self.usage_fetch.is_some()
+    }
+
+    /// After a turn (and its snapshot): refresh the subscription meter if
+    /// it's stale, then run the next queued prompt.
+    fn after_turn_housekeeping(&mut self) {
+        let stale = self.usage_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300));
+        if self.config.features.sub_meter
+            && self.queue.is_empty()
+            && self.turns_done > 0
+            && stale
+            && self.usage_failures < 2
+            && !self.busy()
+        {
+            self.fetch_usage();
+        }
+        self.pump_queue();
+    }
+
+    /// Run the adapter's `/usage` (a local command: no model call) in the
+    /// background and parse the limits out of its reply.
+    fn fetch_usage(&mut self) {
+        let (Some(client), Some(sid)) = (self.client.clone(), self.session.id.clone()) else { return };
+        if !self.session_ready() {
+            return;
+        }
+        self.usage_fetch = Some(String::new());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = client.request("session/prompt", json!({"sessionId": sid, "prompt": [acp::text_block("/usage")]})).await;
+            let _ = tx.send(AppMsg::UsageDone(r));
+        });
     }
 
     fn apply_session_defaults(&mut self) {
@@ -640,6 +806,12 @@ impl App {
     }
 
     fn on_prompt_done(&mut self, res: Result<Value, RpcError>) {
+        if let Ok(v) = &res {
+            self.turn_tokens = Tokens::from_prompt_result(v);
+            if let Some(t) = &self.turn_tokens {
+                self.session_tokens.add(t);
+            }
+        }
         let cancelled = self.cancelling;
         self.responding = false;
         self.cancelling = false;
@@ -679,7 +851,167 @@ impl App {
         if !self.terminal_focused_hint() {
             ring_bell();
         }
-        self.pump_queue();
+        self.turns_done += 1;
+        if self.config.features.narrator && !cancelled {
+            self.narrate_last_turn();
+        }
+        if self.config.features.timeline {
+            self.take_snapshot();
+        } else {
+            self.after_turn_housekeeping();
+        }
+    }
+
+    /// Speak the turn's final message (which usually sums up what was done).
+    fn narrate_last_turn(&mut self) {
+        let last = self.transcript.entries.iter().rev().take_while(|e| !matches!(e.block, Block::User { .. })).find_map(|e| match &e.block {
+            Block::Agent { text } => Some(text.clone()),
+            _ => None,
+        });
+        let Some(last) = last else { return };
+        let summary = narrator::summarize(&last);
+        if let Err(e) = self.narrator.speak(&summary) {
+            self.transcript.notice(Level::Warn, format!("Narrator: {e}"));
+        }
+    }
+
+    fn take_snapshot(&mut self) {
+        let label = crate::text::truncate(self.turn_prompt.lines().next().unwrap_or("turn"), 60);
+        self.timeline_busy = true;
+        let tl = self.timeline.clone();
+        let cwd = self.cwd.clone();
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let r = tl.lock().map_err(|_| anyhow::anyhow!("timeline lock poisoned")).and_then(|mut t| t.snapshot(&cwd, &label));
+            let msg = match r {
+                Ok(_) => None,
+                Err(e) => Some((format!("Time Machine snapshot failed: {e}"), true)),
+            };
+            let _ = tx.send(AppMsg::Timeline(msg));
+        });
+    }
+
+    fn timeline_jump(&mut self, to: usize) {
+        if self.busy() {
+            self.toast("Wait for Claude to finish first");
+            return;
+        }
+        self.timeline_busy = true;
+        let tl = self.timeline.clone();
+        let cwd = self.cwd.clone();
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let r = tl.lock().map_err(|_| anyhow::anyhow!("timeline lock poisoned")).and_then(|mut t| {
+                let n = t.jump(&cwd, to)?;
+                let label = t.snaps[to].label.clone();
+                Ok((n, label))
+            });
+            let msg = match r {
+                Ok((n, label)) => Some((format!("Restored “{label}” · {n} file{}", if n == 1 { "" } else { "s" }), false)),
+                Err(e) => Some((format!("Time Machine: {e}"), true)),
+            };
+            let _ = tx.send(AppMsg::Timeline(msg));
+        });
+    }
+
+    fn timeline_step(&mut self, delta: isize) {
+        let (cur, len, avail) = match self.timeline.lock() {
+            Ok(t) => (t.cur, t.snaps.len(), t.available()),
+            Err(_) => return,
+        };
+        if len == 0 {
+            self.toast(if avail || !self.config.features.timeline { "No snapshots yet" } else { "Time Machine needs a git repository" });
+            return;
+        }
+        let to = cur as isize + delta;
+        if to < 0 || to as usize >= len {
+            self.toast(if delta < 0 { "Already at the oldest snapshot" } else { "Already at the newest snapshot" });
+            return;
+        }
+        self.timeline_jump(to as usize);
+    }
+
+    fn open_timeline(&mut self) {
+        let Ok(t) = self.timeline.lock() else { return };
+        if t.snaps.is_empty() {
+            drop(t);
+            self.toast("No snapshots yet — they're taken after each turn that changes files");
+            return;
+        }
+        let items: Vec<PickItem> = t
+            .snaps
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, sn)| {
+                let mark = if i == t.cur { "◉" } else if i > t.cur { "○" } else { "●" };
+                let detail = match (i, sn.changed) {
+                    (0, _) => format!("{} · start", sn.time.format("%H:%M")),
+                    (_, n) => format!("{} · {n} file{}", sn.time.format("%H:%M"), if n == 1 { "" } else { "s" }),
+                };
+                PickItem { label: format!("{mark} {}", sn.label), detail, value: i.to_string(), current: i == t.cur }
+            })
+            .collect();
+        drop(t);
+        self.open_picker(PickerKind::Timeline, "Timeline  ·  Enter restore  ·  → preview", items);
+    }
+
+    fn preview_timeline(&mut self, idx: usize) {
+        let cwd = self.cwd.clone();
+        let r = self.timeline.lock().map_err(|_| anyhow::anyhow!("timeline lock poisoned")).and_then(|mut t| {
+            let stat = t.diff_stat(&cwd, idx)?;
+            let diff = t.diff(&cwd, idx)?;
+            Ok((t.snaps[idx].label.clone(), format!("{stat}\n{diff}")))
+        });
+        match r {
+            Ok((label, text)) => self.overlay = Overlay::Viewer { title: format!("Snapshot · {label}"), text, scroll: 0 },
+            Err(e) => self.toast(format!("Couldn't diff: {e}")),
+        }
+    }
+
+    pub fn toggle_narrator(&mut self) {
+        if self.narrator.speaking() {
+            self.narrator.stop();
+            self.narrating = false;
+            return;
+        }
+        self.config.features.narrator = !self.config.features.narrator;
+        let _ = self.config.save();
+        if !self.config.features.narrator {
+            self.narrator.stop();
+        }
+        self.toast(if self.config.features.narrator { "Narrator on" } else { "Narrator off" });
+    }
+
+    fn open_commit_picker(&mut self) {
+        let items = vec![
+            PickItem { label: "Commit and push".into(), detail: "recommended".into(), value: "push".into(), current: true },
+            PickItem { label: "Commit only".into(), detail: "don't push".into(), value: "commit".into(), current: false },
+            PickItem { label: "Commit on a new branch".into(), detail: "named after the changes".into(), value: "branch".into(), current: false },
+        ];
+        self.open_picker(PickerKind::Commit, "Commit", items);
+    }
+
+    fn run_commit(&mut self, how: &str) {
+        let (label, step) = match how {
+            "commit" => ("commit only", "Commit on the current branch. Do not push."),
+            "branch" => (
+                "new branch",
+                "First create and switch to a new branch with a short, descriptive name based on the changes, then commit there. Do not push.",
+            ),
+            _ => ("commit & push", "Commit on the current branch, then push it (set the upstream if it has none)."),
+        };
+        let text = format!(
+            "Commit my uncommitted changes in this git repository.\n\
+             - Read `git status` and `git diff` (staged and unstaged, plus untracked files) and group the changes into logical units.\n\
+             - Make one Conventional Commit per group (`type(scope): summary`, imperative mood, under 72 characters; add a body only when it explains why). Stage only that group's files for each commit.\n\
+             - Never stage secrets or credentials (.env files, private keys, tokens, *.pem, credential files). If you find any, leave them unstaged and tell me.\n\
+             - Do not add Co-Authored-By trailers or any mention of Claude or AI to the commits.\n\
+             - {step}\n\
+             - Finish with one line per commit: short hash and subject."
+        );
+        let out = Outgoing { text, haiku: true, max_effort: false };
+        self.enqueue(format!("/commit · {label}"), out);
     }
 
     fn terminal_focused_hint(&self) -> bool {
@@ -690,6 +1022,18 @@ impl App {
         match inc {
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
+                    if let (Some(buf), Some(u)) = (self.usage_fetch.as_mut(), params.get("update")) {
+                        let kind = u.get("sessionUpdate").and_then(|k| k.as_str()).unwrap_or("");
+                        if kind == "agent_message_chunk" {
+                            if let Some(t) = u.get("content").and_then(crate::model::content_text) {
+                                buf.push_str(&t);
+                            }
+                            return;
+                        }
+                        if matches!(kind, "user_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "plan") {
+                            return;
+                        }
+                    }
                     if let Some(u) = params.get("update") {
                         let fx = self.transcript.apply_update(&mut self.session, u);
                         if self.responding {
@@ -878,24 +1222,32 @@ impl App {
                 return;
             }
         }
-        if self.responding || !self.session_ready() {
-            let idx = self.transcript.push(Block::User { text: text.clone(), queued: true });
-            self.queue.push_back((text, idx));
+        let out = Outgoing::parse(&text);
+        self.enqueue(out.text.clone(), out);
+    }
+
+    /// Show `display` as the user's prompt and send `out` now, or queue it
+    /// if Claude is busy.
+    fn enqueue(&mut self, display: String, out: Outgoing) {
+        let tag = out.tag();
+        if self.busy() || !self.session_ready() {
+            let idx = self.transcript.push(Block::User { text: display, queued: true, tag });
+            self.queue.push_back((out, idx));
             self.follow = true;
             if !self.session_ready() && !matches!(self.conn, Conn::Starting(_)) {
                 self.toast("Agent isn't running — /restart to start it");
             }
             return;
         }
-        let idx = self.transcript.push(Block::User { text: text.clone(), queued: false });
-        self.send_prompt(text, idx);
+        let idx = self.transcript.push(Block::User { text: display, queued: false, tag });
+        self.send_prompt(out, idx);
     }
 
     fn pump_queue(&mut self) {
-        if self.responding || !self.session_ready() {
+        if self.busy() || !self.session_ready() {
             return;
         }
-        if let Some((text, idx)) = self.queue.pop_front() {
+        if let Some((out, idx)) = self.queue.pop_front() {
             // Move the queued entry to the end so the transcript order stays true.
             if idx < self.transcript.entries.len() {
                 if let Block::User { queued, .. } = &mut self.transcript.entries[idx].block {
@@ -924,12 +1276,53 @@ impl App {
                 }
             }
             let new_idx = self.transcript.entries.len() - 1;
-            self.send_prompt(text, new_idx);
+            self.send_prompt(out, new_idx);
         }
     }
 
-    fn send_prompt(&mut self, text: String, _entry: usize) {
+    /// (config id, value for this turn, value to restore afterwards)
+    fn turn_overrides(&mut self, out: &Outgoing) -> Vec<(String, String, String)> {
+        let mut v = Vec::new();
+        if out.haiku {
+            let found = if let Some(o) = self.session.option("model") {
+                o.options
+                    .iter()
+                    .find(|(val, name, _)| val.to_lowercase().contains("haiku") || name.to_lowercase().contains("haiku"))
+                    .map(|(val, _, _)| (o.id.clone(), val.clone(), o.current.clone()))
+            } else {
+                self.session
+                    .models
+                    .iter()
+                    .find(|m| m.id.to_lowercase().contains("haiku") || m.name.to_lowercase().contains("haiku"))
+                    .map(|m| ("__model".to_string(), m.id.clone(), self.session.model.clone()))
+            };
+            match found {
+                Some(f) if f.1 != f.2 => v.push(f),
+                Some(_) => {}
+                None => self.toast("Haiku isn't offered here — using the session's model"),
+            }
+        }
+        if out.max_effort {
+            match self.session.option("effort") {
+                Some(o) => {
+                    let max = o.options.iter().find(|(val, _, _)| val == "max").or(o.options.last()).map(|x| x.0.clone());
+                    if let Some(max) = max.filter(|m| *m != o.current) {
+                        v.push((o.id.clone(), max, o.current.clone()));
+                    }
+                }
+                None => self.toast("Effort isn't configurable for this model"),
+            }
+        }
+        v
+    }
+
+    fn send_prompt(&mut self, out: Outgoing, _entry: usize) {
         let (Some(client), Some(sid)) = (self.client.clone(), self.session.id.clone()) else { return };
+        let overrides = self.turn_overrides(&out);
+        self.turn_tag = out.tag();
+        self.turn_prompt = out.text.clone();
+        let text = out.text;
+        self.narrator.stop();
         self.transcript.begin_turn();
         self.responding = true;
         self.cancelling = false;
@@ -945,8 +1338,28 @@ impl App {
             }
         }
         let tx = self.tx.clone();
+        let baseline = self.config.features.timeline.then(|| (self.timeline.clone(), self.cwd.clone()));
         tokio::spawn(async move {
+            // Time Machine: record the starting state before the first turn touches anything.
+            if let Some((tl, cwd)) = baseline {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut t) = tl.lock() {
+                        if t.snaps.is_empty() {
+                            let _ = t.snapshot(&cwd, "start");
+                        }
+                    }
+                })
+                .await;
+            }
+            for (id, value, _) in &overrides {
+                let r = set_option_request(&client, &sid, id, value).await;
+                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(value.clone()) } else { AppMsg::ConfigSet(r) });
+            }
             let r = client.request("session/prompt", json!({"sessionId": sid, "prompt": blocks})).await;
+            for (id, _, prev) in overrides.iter().rev() {
+                let r2 = set_option_request(&client, &sid, id, prev).await;
+                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(prev.clone()) } else { AppMsg::ConfigSet(r2) });
+            }
             let _ = tx.send(AppMsg::PromptDone(r));
         });
     }
@@ -991,6 +1404,8 @@ impl App {
                 self.session.title = None;
                 self.session.used = 0;
                 self.session.cost = None;
+                self.turn_tokens = None;
+                self.session_tokens = Tokens::default();
                 self.update_title();
                 if self.client.is_some() {
                     self.open_session(SessionKind::New);
@@ -1106,6 +1521,22 @@ impl App {
                 }
             }
             "export" => self.export(args),
+            "commit" => match args {
+                "push" | "commit" | "branch" => self.run_commit(args),
+                _ => self.open_commit_picker(),
+            },
+            "timeline" => self.open_timeline(),
+            "undo" => self.timeline_step(-1),
+            "redo" => self.timeline_step(1),
+            "after" => {
+                if args.is_empty() {
+                    self.toast("Usage: /after <task> — runs once Claude finishes");
+                } else {
+                    let out = Outgoing::parse(args);
+                    self.enqueue(out.text.clone(), out);
+                }
+            }
+            "narrator" => self.toggle_narrator(),
             "context" => {
                 let s = &self.session;
                 let msg = if s.size > 0 {
@@ -1277,6 +1708,12 @@ impl App {
             PickerKind::Mode => self.set_mode(&item.value),
             PickerKind::Theme => self.apply_theme(&item.value, true),
             PickerKind::Resume => self.resume(item.value),
+            PickerKind::Commit => self.run_commit(&item.value),
+            PickerKind::Timeline => {
+                if let Ok(i) = item.value.parse() {
+                    self.timeline_jump(i);
+                }
+            }
         }
     }
 
@@ -1496,6 +1933,12 @@ impl App {
                         return;
                     }
                 }
+                if let Some(b) = self.layout.narrator_button {
+                    if b.contains((x, y).into()) {
+                        self.toggle_narrator();
+                        return;
+                    }
+                }
                 if self.layout.prompt_area.contains((x, y).into()) {
                     self.focus = Focus::Prompt;
                     return;
@@ -1651,6 +2094,12 @@ impl App {
                 match k.code {
                     KeyCode::Esc => self.picker_cancel(),
                     KeyCode::Enter => self.picker_choose(),
+                    KeyCode::Right if p.kind == PickerKind::Timeline => {
+                        let vis = p.visible();
+                        if let Some(i) = vis.get(p.sel).and_then(|i| p.items.get(*i)).and_then(|it| it.value.parse().ok()) {
+                            self.preview_timeline(i);
+                        }
+                    }
                     KeyCode::Up => {
                         p.sel = p.sel.saturating_sub(1);
                         self.picker_preview();
@@ -1806,6 +2255,15 @@ impl App {
                     self.toggle_fold(i);
                 }
             }
+            KeyCode::Char('o') | KeyCode::Char('r') => match self.selected_path() {
+                Some(p) => {
+                    let r = if k.code == KeyCode::Char('o') { peek::open(&p) } else { peek::reveal(&p) };
+                    if let Err(e) = r {
+                        self.toast(format!("Couldn't open {}: {e}", p.display()));
+                    }
+                }
+                None => self.toast("No file on this entry"),
+            },
             KeyCode::Char('E') => {
                 let any_collapsed = self.transcript.entries.iter().any(|e| e.foldable() && e.fold == Fold::Collapsed);
                 for e in self.transcript.entries.iter_mut() {
@@ -1857,6 +2315,19 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The file a selected tool entry touched, if it exists on disk.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        let e = self.transcript.entries.get(self.selected?)?;
+        let Block::Tool(t) = &e.block else { return None };
+        let raw = t.locations.first().cloned().or_else(|| {
+            ["file_path", "path", "notebook_path"]
+                .iter()
+                .find_map(|k| t.raw_input.get(*k).and_then(|v| v.as_str()).map(str::to_owned))
+        })?;
+        let p = peek::resolve(&self.cwd, &raw);
+        p.exists().then_some(p)
     }
 
     fn open_viewer(&mut self) {
@@ -2215,4 +2686,32 @@ fn base64_encode(data: &[u8]) -> String {
         out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
     out
+}
+
+/// Set a session config option (or the legacy model) and wait for the reply.
+async fn set_option_request(client: &AcpClient, sid: &str, id: &str, value: &str) -> Result<Value, RpcError> {
+    if id == "__model" {
+        client.request("session/set_model", json!({"sessionId": sid, "modelId": value})).await.map(|_| Value::Null)
+    } else {
+        client.request("session/set_config_option", json!({"sessionId": sid, "configId": id, "value": value})).await
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::Outgoing;
+
+    #[test]
+    fn prefixes() {
+        let o = Outgoing::parse("_ fix the test");
+        assert!(o.haiku && !o.max_effort);
+        assert_eq!(o.text, "fix the test");
+        let o = Outgoing::parse("+_refactor this");
+        assert!(o.haiku && o.max_effort);
+        assert_eq!(o.text, "refactor this");
+        // Not markers: dunder names, +1, a bare prefix.
+        assert!(!Outgoing::parse("__init__.py is empty").haiku);
+        assert!(!Outgoing::parse("+1 to that").max_effort);
+        assert_eq!(Outgoing::parse("_").text, "_");
+    }
 }

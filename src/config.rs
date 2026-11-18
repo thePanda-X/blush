@@ -11,6 +11,26 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
+    pub features: FeaturesConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeaturesConfig {
+    /// Read a short summary of each finished turn aloud (/narrator toggles).
+    pub narrator: bool,
+    /// Show 5-hour / weekly subscription usage in the footer.
+    pub sub_meter: bool,
+    /// Show per-turn and session token counts above the prompt.
+    pub token_meter: bool,
+    /// Snapshot the git working tree after each turn (/timeline, /undo, /redo).
+    pub timeline: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        FeaturesConfig { narrator: false, sub_meter: true, token_meter: true, timeline: true }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,7 +104,7 @@ impl Default for AgentConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { ui: UiConfig::default(), agent: AgentConfig::default() }
+        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default() }
     }
 }
 

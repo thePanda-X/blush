@@ -8,9 +8,13 @@ mod input;
 mod launcher;
 mod markdown;
 mod model;
+mod narrator;
+mod peek;
 mod text;
 mod theme;
+mod timeline;
 mod ui;
+mod usage;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -227,7 +231,9 @@ async fn run_tui(
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 let toast_live = app.toast.as_ref().is_some_and(|(_, t)| t.elapsed() < Duration::from_millis(2700));
-                if app.animating() || toast_live {
+                // Every 6s: the subscription meter alternates 5h / weekly.
+                let meter_flip = app.tick % 120 == 0 && !app.limits.is_empty();
+                if app.animating() || toast_live || meter_flip || app.poll_narrator() {
                     app.dirty = true;
                 }
             }
