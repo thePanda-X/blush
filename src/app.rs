@@ -36,6 +36,8 @@ pub enum AppMsg {
     Sessions(Result<Value, RpcError>),
     /// Legacy `session/set_model` change made by a per-turn override.
     LegacyModel(String),
+    /// The throwaway session a `/usage` fetch runs in was created.
+    UsageProbe(String),
     /// A background `/usage` fetch for the subscription meter finished.
     UsageDone(Result<Value, RpcError>),
     /// A Time Machine snapshot or jump finished: (toast/notice, is_error).
@@ -254,8 +256,10 @@ pub struct App {
     pub timeline: Arc<std::sync::Mutex<Timeline>>,
     /// A snapshot or jump is running; prompts wait for it.
     pub timeline_busy: bool,
-    /// Buffer of a background `/usage` turn while it runs.
-    pub usage_fetch: Option<String>,
+    /// A background `/usage` fetch is running.
+    pub usage_inflight: bool,
+    /// (throwaway session id, its reply so far) while a fetch runs.
+    pub usage_probe: Option<(String, String)>,
     pub usage_fetched: Option<Instant>,
     pub usage_failures: u8,
     pub limits: Vec<LimitWindow>,
@@ -358,7 +362,8 @@ impl App {
             narrating: false,
             timeline: Arc::new(std::sync::Mutex::new(Timeline::default())),
             timeline_busy: false,
-            usage_fetch: None,
+            usage_inflight: false,
+            usage_probe: None,
             usage_fetched: None,
             usage_failures: 0,
             limits: Vec::new(),
@@ -669,6 +674,7 @@ impl App {
                 }
                 // Flush prompts typed while starting up.
                 self.pump_queue();
+                self.maybe_refresh_usage();
             }
             AppMsg::SessionFailed(e) => {
                 self.conn = Conn::Failed(e.clone());
@@ -709,17 +715,18 @@ impl App {
                 Err(e) => self.transcript.notice(Level::Error, format!("Couldn't list sessions: {e}")),
             },
             AppMsg::LegacyModel(m) => self.session.model = m,
+            AppMsg::UsageProbe(sid) => self.usage_probe = Some((sid, String::new())),
             AppMsg::UsageDone(res) => {
-                let buf = self.usage_fetch.take().unwrap_or_default();
+                let buf = self.usage_probe.take().map(|(_, b)| b).unwrap_or_default();
+                self.usage_inflight = false;
                 let limits = crate::usage::parse_limits(&buf);
                 if res.is_ok() && !limits.is_empty() {
                     self.limits = limits;
                     self.usage_failures = 0;
                 } else {
-                    self.usage_failures += 1;
+                    self.usage_failures = self.usage_failures.saturating_add(1);
                 }
                 self.usage_fetched = Some(Instant::now());
-                self.pump_queue();
             }
             AppMsg::Timeline(msg) => {
                 self.timeline_busy = false;
@@ -736,36 +743,54 @@ impl App {
 
     /// Anything other than a user turn that must finish before the next prompt.
     pub fn busy(&self) -> bool {
-        self.responding || self.timeline_busy || self.usage_fetch.is_some()
+        self.responding || self.timeline_busy
     }
 
     /// After a turn (and its snapshot): refresh the subscription meter if
     /// it's stale, then run the next queued prompt.
     fn after_turn_housekeeping(&mut self) {
-        let stale = self.usage_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300));
-        if self.config.features.sub_meter
-            && self.queue.is_empty()
-            && self.turns_done > 0
-            && stale
-            && self.usage_failures < 2
-            && !self.busy()
-        {
-            self.fetch_usage();
-        }
+        self.maybe_refresh_usage();
         self.pump_queue();
     }
 
-    /// Run the adapter's `/usage` (a local command: no model call) in the
-    /// background and parse the limits out of its reply.
-    fn fetch_usage(&mut self) {
-        let (Some(client), Some(sid)) = (self.client.clone(), self.session.id.clone()) else { return };
-        if !self.session_ready() {
-            return;
+    /// Refresh the subscription meter if it's on and older than 5 minutes
+    /// (backing off to 30 minutes after repeated failures).
+    pub fn maybe_refresh_usage(&mut self) {
+        let every = if self.usage_failures >= 3 { 1800 } else { 300 };
+        let stale = self.usage_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(every));
+        if self.config.features.sub_meter && stale && !self.usage_inflight && self.session_ready() {
+            self.fetch_usage();
         }
-        self.usage_fetch = Some(String::new());
+    }
+
+    /// Run Claude Code's `/usage` (a local command: no model call) in a
+    /// throwaway session, so the user's own session and history never see it,
+    /// then close and delete that session.
+    fn fetch_usage(&mut self) {
+        let Some(client) = self.client.clone() else { return };
+        let caps = self.agent_caps.get("sessionCapabilities").cloned().unwrap_or(Value::Null);
+        let (can_close, can_delete) = (caps.get("close").is_some(), caps.get("delete").is_some());
+        let dir = home_dir().join("usage-probe");
+        let _ = std::fs::create_dir_all(&dir);
+        self.usage_inflight = true;
         let tx = self.tx.clone();
         tokio::spawn(async move {
+            let cwd = dir.to_string_lossy().to_string();
+            let sid = match client.request("session/new", json!({"cwd": cwd, "mcpServers": []})).await {
+                Ok(v) => s(&v, "sessionId"),
+                Err(e) => {
+                    let _ = tx.send(AppMsg::UsageDone(Err(e)));
+                    return;
+                }
+            };
+            let _ = tx.send(AppMsg::UsageProbe(sid.clone()));
             let r = client.request("session/prompt", json!({"sessionId": sid, "prompt": [acp::text_block("/usage")]})).await;
+            if can_close {
+                let _ = client.request("session/close", json!({"sessionId": sid})).await;
+            }
+            if can_delete {
+                let _ = client.request("session/delete", json!({"sessionId": sid})).await;
+            }
             let _ = tx.send(AppMsg::UsageDone(r));
         });
     }
@@ -1025,17 +1050,17 @@ impl App {
         match inc {
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
-                    if let (Some(buf), Some(u)) = (self.usage_fetch.as_mut(), params.get("update")) {
-                        let kind = u.get("sessionUpdate").and_then(|k| k.as_str()).unwrap_or("");
-                        if kind == "agent_message_chunk" {
-                            if let Some(t) = u.get("content").and_then(crate::model::content_text) {
-                                buf.push_str(&t);
+                    // The `/usage` probe's session: capture its reply, ignore the rest.
+                    let update_sid = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                    if !update_sid.is_empty() && Some(update_sid) != self.session.id.as_deref() {
+                        if let (Some((probe, buf)), Some(u)) = (self.usage_probe.as_mut(), params.get("update")) {
+                            if probe == update_sid && s(u, "sessionUpdate") == "agent_message_chunk" {
+                                if let Some(t) = u.get("content").and_then(crate::model::content_text) {
+                                    buf.push_str(&t);
+                                }
                             }
-                            return;
                         }
-                        if matches!(kind, "user_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "plan") {
-                            return;
-                        }
+                        return;
                     }
                     if let Some(u) = params.get("update") {
                         let fx = self.transcript.apply_update(&mut self.session, u);

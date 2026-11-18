@@ -239,8 +239,9 @@ AI attribution. You can skip the menu with `/commit push`, `/commit commit`, or 
 | **Subscription** | Footer, right | Your 5-hour and weekly limits, alternating every few seconds, with a bar, the percentage used, and the time until each resets. |
 
 The subscription meter comes from Claude Code's `/usage` command. That command runs locally and
-doesn't call the model. blush runs it quietly after a turn, at most every five minutes, and hides
-those exchanges when you resume a session.
+doesn't call the model. blush runs it at startup and then at most every five minutes, in a
+throwaway background session that it closes and deletes right away. It never touches your own
+session or history.
 
 ### Narrator
 

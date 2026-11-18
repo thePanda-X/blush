@@ -331,7 +331,9 @@ pub fn group_summary(members: &[&Entry], ctx: &Ctx, open: bool) -> Line<'static>
     } else {
         vec![bullet(th, ctx.tick, live.is_some(), false, th.accent)]
     };
-    spans.push(Span::styled(parts.join(" · "), if open { th.muted() } else { th.secondary() }));
+    // Compact groups are tinted with the accent (pink in the default theme).
+    let pink = Style::default().fg(if open { blend(th.bg, th.accent, 0.75) } else { th.accent });
+    spans.push(Span::styled(parts.join(" · "), pink));
     if ins + del > 0 {
         spans.push(Span::styled(format!(" +{ins}"), Style::default().fg(th.diff_ins_fg)));
         spans.push(Span::styled(format!(" -{del}"), Style::default().fg(th.diff_del_fg)));
@@ -339,7 +341,7 @@ pub fn group_summary(members: &[&Entry], ctx: &Ctx, open: bool) -> Line<'static>
     if let (Some(f), Some(l)) = (first, last_end) {
         let d = l.saturating_duration_since(f);
         if d.as_secs_f64() >= 1.0 {
-            spans.push(Span::styled(format!("  {}", human_duration(d)), th.dim()));
+            spans.push(Span::styled(format!("  {}", human_duration(d)), Style::default().fg(blend(th.bg, th.accent, 0.55))));
         }
     }
     if failed > 0 {

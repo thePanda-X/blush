@@ -19,6 +19,10 @@ pub fn parse_limits(md: &str) -> Vec<LimitWindow> {
     let mut out = Vec::new();
     for line in md.lines() {
         let line = normalize_spaces(line.trim());
+        if let Some(w) = parse_plain_line(&line, Local::now()) {
+            out.push(w);
+            continue;
+        }
         let Some(rest) = line.strip_prefix("**") else { continue };
         let Some((label, rest)) = rest.split_once("**") else { continue };
         let Some(rest) = rest.trim_start().strip_prefix('—').map(str::trim_start) else { continue };
@@ -42,6 +46,55 @@ pub fn parse_limits(md: &str) -> Vec<LimitWindow> {
 pub fn meter_windows(all: &[LimitWindow]) -> Vec<&LimitWindow> {
     let main: Vec<&LimitWindow> = all.iter().filter(|w| w.label == "5h" || w.label == "week").collect();
     if main.is_empty() { all.iter().take(1).collect() } else { main }
+}
+
+/// Claude Code's own text format, which the adapter falls back to when its
+/// structured `/usage` call times out:
+/// `Current week (all models): 20% used · resets Nov 23, 4pm (Europe/Paris)`
+/// `Current session: 34% used · resets 9pm (Europe/Paris)`
+fn parse_plain_line(line: &str, now: DateTime<Local>) -> Option<LimitWindow> {
+    let rest = line.strip_prefix("Current ")?;
+    let (label, rest) = rest.split_once(':')?;
+    let (pct, rest) = rest.trim().split_once('%')?;
+    let percent = pct.trim().parse::<f64>().ok()?;
+    let label = match label.trim() {
+        "session" => "5h".to_string(),
+        "week (all models)" => "week".to_string(),
+        l => match l.strip_prefix("week (").and_then(|m| m.strip_suffix(')')) {
+            Some(m) => format!("week {}", m.to_lowercase()),
+            None => l.to_string(),
+        },
+    };
+    let resets = rest.split_once("resets ").and_then(|(_, r)| {
+        let r = r.split(" (").next().unwrap_or(r).trim();
+        parse_plain_reset(r, now)
+    });
+    Some(LimitWindow { label, percent, resets })
+}
+
+/// `Nov 23, 4pm`, `Nov 23, 4:30pm`, `9pm` (today, or tomorrow if passed).
+fn parse_plain_reset(s: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
+    let (date, time) = match s.rsplit_once(", ") {
+        Some((d, t)) => (Some(d.trim()), t.trim()),
+        None => (None, s.trim()),
+    };
+    let t = time.to_lowercase();
+    let (clock, ampm) = if let Some(c) = t.strip_suffix("am") {
+        (c, "AM")
+    } else if let Some(c) = t.strip_suffix("pm") {
+        (c, "PM")
+    } else {
+        return None;
+    };
+    let clock = if clock.contains(':') { clock.trim().to_string() } else { format!("{}:00", clock.trim()) };
+    match date {
+        Some(d) => parse_reset(&format!("{d}, {clock} {ampm}"), now),
+        None => {
+            let naive_t = chrono::NaiveTime::parse_from_str(&format!("{clock} {ampm}"), "%I:%M %p").ok()?;
+            let today = Local.from_local_datetime(&now.date_naive().and_time(naive_t)).earliest()?;
+            Some(if today < now { today + chrono::Duration::days(1) } else { today })
+        }
+    }
 }
 
 fn normalize_spaces(s: &str) -> String {
@@ -154,6 +207,23 @@ mod tests {
         assert_eq!(v[0].percent, 19.0);
         assert!(v[0].resets.is_some());
         assert_eq!(meter_windows(&v).len(), 1, "only the all-models week is shown");
+    }
+
+    #[test]
+    fn parses_claude_code_plain_text() {
+        let txt = "You are currently using your subscription to power your Claude Code usage\n\n\
+                   Current session: 34% used · resets 9pm (Europe/Paris)\n\
+                   Current week (all models): 20% used · resets Nov 23, 4pm (Europe/Paris)\n\
+                   Current week (Fable): 0% used · resets Nov 23, 4:30pm (Europe/Paris)\n\n\
+                   Last 24h · 1563 requests · 28 sessions\n  87%  Start fresh when you switch tasks";
+        let v = parse_limits(txt);
+        assert_eq!(v.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "week", "week fable"]);
+        assert_eq!(v[1].percent, 20.0);
+        assert!(v.iter().all(|w| w.resets.is_some()));
+        let now = Local.with_ymd_and_hms(2026, 11, 18, 22, 0, 0).unwrap();
+        // 9pm already passed today, so it's tomorrow at 9pm.
+        assert_eq!(until(parse_plain_reset("9pm", now).unwrap(), now), "23h00m");
+        assert_eq!(meter_windows(&v).len(), 2);
     }
 
     #[test]
