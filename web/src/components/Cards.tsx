@@ -61,6 +61,8 @@ export function PermissionCard({ p, index, total }: { p: Permission; index: numb
 
 type Answers = Record<string, unknown>;
 
+const answered = (v: unknown) => (Array.isArray(v) ? v.length > 0 : typeof v === "string" ? v.trim() !== "" : v !== undefined);
+
 export function QuestionCard({ q }: { q: Question }) {
   const [answers, setAnswers] = useState<Answers>(() => {
     const a: Answers = {};
@@ -69,10 +71,17 @@ export function QuestionCard({ q }: { q: Question }) {
     return a;
   });
   const [sent, setSent] = useState(false);
-  const missing = q.fields.some((f) => f.kind === "single" && !answers[f.key]);
+  // Only required fields block Submit; a choice counts as answered by its "Other" text too.
+  const missing = q.fields.some((f) => f.required && !answered(answers[f.key]) && !(f.other && answered(answers[f.other])));
   const reply = (action: "accept" | "decline" | "cancel") => {
     setSent(true);
-    command({ t: "question", id: q.id, action, content: action === "accept" ? answers : undefined });
+    // Leave skipped fields out rather than sending empty strings and lists.
+    const content = Object.fromEntries(
+      Object.entries(answers)
+        .filter(([, v]) => typeof v === "boolean" || answered(v))
+        .map(([k, v]) => [k, typeof v === "string" ? v.trim() : v]),
+    );
+    command({ t: "question", id: q.id, action, content: action === "accept" ? content : undefined });
   };
   const set = (k: string, v: unknown) => setAnswers((a) => ({ ...a, [k]: v }));
   return (
@@ -83,7 +92,17 @@ export function QuestionCard({ q }: { q: Question }) {
       </div>
       <div className="mt-2 max-h-[45dvh] space-y-3 overflow-y-auto pr-1">
         {q.fields.map((f) => (
-          <Field key={f.key} f={f} value={answers[f.key]} onChange={(v) => set(f.key, v)} />
+          <div key={f.key} className="space-y-2">
+            <Field f={f} value={answers[f.key]} onChange={(v) => set(f.key, v)} />
+            {f.other && (
+              <OtherBox
+                id={`q-${f.other}`}
+                multi={f.kind === "multi"}
+                value={(answers[f.other] as string) ?? ""}
+                onChange={(v) => set(f.other!, v)}
+              />
+            )}
+          </div>
         ))}
       </div>
       <div className="mt-3 flex flex-wrap gap-2">
@@ -101,6 +120,34 @@ export function QuestionCard({ q }: { q: Question }) {
   );
 }
 
+/** A choice question's free-text answer: instead of a pick, or added to a multi-select's picks. */
+function OtherBox({ id, multi, value, onChange }: { id: string; multi: boolean; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="pl-2">
+      <label htmlFor={id} className="sr-only">
+        Other
+      </label>
+      <input
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={multi ? "Other: add your own answer (optional)" : "Other: type your own answer (optional)"}
+        className="h-9 w-full rounded-md border border-line bg-bg px-3 text-fg outline-none placeholder:text-muted focus:border-accent"
+        autoComplete="off"
+      />
+    </div>
+  );
+}
+
+function Preview({ text }: { text?: string | null }) {
+  if (!text) return null;
+  return (
+    <pre data-preview className="mt-1 max-h-60 overflow-auto rounded-md bg-bg px-3 py-2 text-[0.88em] whitespace-pre text-fg2">
+      {text}
+    </pre>
+  );
+}
+
 function Field({ f, value, onChange }: { f: QuestionField; value: unknown; onChange: (v: unknown) => void }) {
   const id = `q-${f.key}`;
   const head = (
@@ -114,7 +161,14 @@ function Field({ f, value, onChange }: { f: QuestionField; value: unknown; onCha
   if (f.kind === "single")
     return (
       <div>
-        {head}
+        <div className="flex items-start justify-between gap-2">
+          {head}
+          {!f.required && !!value && (
+            <button type="button" onClick={() => onChange(undefined)} className="shrink-0 text-[0.88em] text-muted hover:text-fg">
+              Clear
+            </button>
+          )}
+        </div>
         <RadioGroup.Root id={id} value={(value as string) ?? ""} onValueChange={onChange} className="space-y-1" aria-label={f.title}>
           {f.options.map((o) => (
             <label key={o.value} className="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-hover">
@@ -131,6 +185,7 @@ function Field({ f, value, onChange }: { f: QuestionField; value: unknown; onCha
             </label>
           ))}
         </RadioGroup.Root>
+        <Preview text={f.options.find((o) => o.value === value)?.preview} />
       </div>
     );
   if (f.kind === "multi") {
@@ -156,7 +211,11 @@ function Field({ f, value, onChange }: { f: QuestionField; value: unknown; onCha
                     <Check size={12} strokeWidth={3} />
                   </Checkbox.Indicator>
                 </Checkbox.Root>
-                <span className="text-fg">{o.name}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="text-fg">{o.name}</span>
+                  {o.description && <span className="block text-[0.88em] text-muted">{o.description}</span>}
+                  {on && <Preview text={o.preview} />}
+                </span>
               </label>
             );
           })}

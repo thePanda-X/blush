@@ -48,12 +48,20 @@ export interface Permission {
   options: { id: string; name: string; kind: string }[];
 }
 
+export interface QuestionOption extends Choice {
+  /** Mockup or snippet to show while this option is picked. */
+  preview?: string | null;
+}
+
 export interface QuestionField {
   key: string;
   title: string;
   description: string;
   kind: "single" | "multi" | "text" | "bool";
-  options: Choice[];
+  options: QuestionOption[];
+  /** Answer key of this choice's free-text "Other" box, if it has one. */
+  other: string | null;
+  required: boolean;
 }
 
 export interface Question {

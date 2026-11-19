@@ -228,7 +228,14 @@ pub fn status_json(app: &App) -> Value {
                     "title": f.title,
                     "description": f.description,
                     "kind": kind,
-                    "options": options.iter().map(|(v, n, d)| json!({"value": v, "name": n, "description": d})).collect::<Vec<_>>(),
+                    "options": options.iter().enumerate().map(|(i, (v, n, d))| json!({
+                        "value": v,
+                        "name": n,
+                        "description": d,
+                        "preview": f.previews.get(i).filter(|p| !p.is_empty()),
+                    })).collect::<Vec<_>>(),
+                    "other": f.other,
+                    "required": f.required,
                 })
             }).collect::<Vec<_>>(),
         })

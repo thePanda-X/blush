@@ -1519,4 +1519,95 @@ Stop it with `blush web down`.")));
         t.diff_focus = true;
         assert_eq!(t.groups(), vec![(0, 2), (3, 5)]);
     }
+
+    /// An AskUserQuestion form exactly as claude-agent-acp 0.106 sends it.
+    fn ask_params() -> Value {
+        json!({"mode":"form","sessionId":"s1","toolCallId":"tc1","message":"Please answer the following questions.","requestedSchema":{"type":"object","properties":{
+            "question_0":{"type":"string","title":"Cache","description":"Which cache?","oneOf":[
+                {"const":"Redis","title":"Redis","description":"fast","_meta":{"_claude/askUserQuestionOption":{"preview":"redis:\n  port: 6379"}}},
+                {"const":"Memcached","title":"Memcached"}]},
+            "question_0_custom":{"type":"string","title":"Other","description":"Type your own answer, or add a note to the option you chose above (optional)."},
+            "question_1":{"type":"array","title":"Extras","description":"Which extras?","items":{"anyOf":[{"const":"Lint","title":"Lint"},{"const":"CI","title":"CI"}]}},
+            "question_1_custom":{"type":"string","title":"Other","description":"Type your own answer to add to your selection above (optional)."}}}})
+    }
+
+    /// Opens the AskUserQuestion card on a client whose replies we can read.
+    fn ask(app: &mut App) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (client, rx) = acp::AcpClient::for_test();
+        app.client = Some(client);
+        app.question = super::super::build_question(json!(7), &ask_params());
+        rx
+    }
+
+    fn reply(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Value {
+        let v: Value = serde_json::from_str(&rx.try_recv().expect("no reply sent")).unwrap();
+        assert_eq!(v["id"], json!(7));
+        v["result"].clone()
+    }
+
+    #[test]
+    fn ask_user_question_folds_other_into_one_step_per_question() {
+        let q = super::super::build_question(json!(1), &ask_params()).unwrap();
+        assert_eq!(q.fields.len(), 2);
+        assert_eq!(q.fields[0].other.as_deref(), Some("question_0_custom"));
+        assert_eq!(q.fields[1].other.as_deref(), Some("question_1_custom"));
+        assert_eq!(q.fields[0].previews, vec!["redis:\n  port: 6379".to_string(), String::new()]);
+        assert_eq!(q.fields[0].rows(), 3);
+        // A plain text field whose key doesn't follow a choice stays its own step.
+        let plain = json!({"mode":"form","message":"m","requestedSchema":{"type":"object","properties":{
+            "name":{"type":"string"},"name_custom":{"type":"string"}}}});
+        assert_eq!(super::super::build_question(json!(1), &plain).unwrap().fields.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_takes_typed_answer_and_empty_multi() {
+        let (mut app, _rx) = app();
+        let mut rx = ask(&mut app);
+        // Typing on a single-select goes to its Other row: the typed text is the answer.
+        typ(&mut app, "Valkey 8").await;
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        // Multi-select: Enter with nothing checked submits nothing.
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert!(app.question.is_none());
+        assert_eq!(reply(&mut rx), json!({"action":"accept","content":{"question_0_custom":"Valkey 8"}}));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_skip_pick_and_multi_with_other() {
+        let (mut app, _rx) = app();
+        let mut rx = ask(&mut app);
+        // Up wraps to the Other row; Enter there with nothing typed skips.
+        app.on_event(key(KeyCode::Up, KeyModifiers::NONE)).await;
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(app.question.as_ref().unwrap().idx, 1);
+        // Check CI, then add a typed extra.
+        app.on_event(key(KeyCode::Down, KeyModifiers::NONE)).await;
+        app.on_event(key(KeyCode::Char(' '), KeyModifiers::NONE)).await;
+        typ(&mut app, "Docs, with examples").await;
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(
+            reply(&mut rx),
+            json!({"action":"accept","content":{"question_1":["CI"],"question_1_custom":"Docs, with examples"}})
+        );
+        // Digits still pick a single-select option directly.
+        let mut rx = ask(&mut app);
+        typ(&mut app, "2").await;
+        app.on_event(key(KeyCode::Char(' '), KeyModifiers::NONE)).await;
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(reply(&mut rx), json!({"action":"accept","content":{"question_0":"Memcached","question_1":["Lint"]}}));
+    }
+
+    #[test]
+    fn ask_user_question_card_shows_preview_and_other_row() {
+        let (mut app, _rx) = app();
+        let _rx2 = ask(&mut app);
+        let s = screen(&mut app, 90, 30);
+        assert!(s.contains("Cache  1/2"), "{s}");
+        assert!(s.contains("│ redis:") && s.contains("│   port: 6379"), "{s}");
+        assert!(s.contains("1. Redis") && s.contains("2. Memcached"), "{s}");
+        assert!(s.contains("Other  type your own answer"), "{s}");
+        // Memcached has no preview.
+        app.question.as_mut().unwrap().sel = 1;
+        assert!(!screen(&mut app, 90, 30).contains("port: 6379"));
+    }
 }

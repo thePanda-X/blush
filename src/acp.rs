@@ -250,6 +250,20 @@ impl AcpClient {
         let _ = self.out.send(msg.to_string());
     }
 
+    /// A client wired to nothing: what it sends lands in the returned receiver.
+    #[cfg(test)]
+    pub fn for_test() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
+        let (out, rx) = mpsc::unbounded_channel();
+        let client = AcpClient {
+            out,
+            close_stdin: Arc::new(Notify::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            child: Mutex::new(None),
+        };
+        (Arc::new(client), rx)
+    }
+
     pub fn respond(&self, id: Value, result: Value) {
         let msg = json!({"jsonrpc": "2.0", "id": id, "result": result});
         let _ = self.out.send(msg.to_string());

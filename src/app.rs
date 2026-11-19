@@ -218,6 +218,36 @@ pub struct Field {
     pub title: String,
     pub description: String,
     pub kind: FieldKind,
+    /// Per-option preview text (mockups, snippets), parallel to the options;
+    /// empty where an option has none.
+    pub previews: Vec<String>,
+    /// Key of the free-text "Other" companion folded into this choice field
+    /// (the adapter's `<key>_custom`), answered from an extra row after the options.
+    pub other: Option<String>,
+    pub required: bool,
+}
+
+impl Field {
+    pub fn options(&self) -> &[(String, String, String)] {
+        match &self.kind {
+            FieldKind::Single(o) | FieldKind::Multi(o, _) => o,
+            _ => &[],
+        }
+    }
+
+    /// Rows the cursor moves over: the options, then the "Other" row if any.
+    pub fn rows(&self) -> usize {
+        match &self.kind {
+            FieldKind::Bool => 2,
+            FieldKind::Text => 0,
+            _ => self.options().len() + usize::from(self.other.is_some()),
+        }
+    }
+
+    /// Whether `sel` is the "Other" row.
+    pub fn on_other(&self, sel: usize) -> bool {
+        self.other.is_some() && sel == self.options().len()
+    }
 }
 
 pub struct QuestionCard {
@@ -2289,6 +2319,11 @@ impl App {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k).await,
             Event::Paste(s) => {
                 if let Some(q) = self.question.as_mut() {
+                    match q.fields.get(q.idx) {
+                        Some(f) if f.other.is_some() => q.sel = f.options().len(),
+                        Some(f) if !matches!(f.kind, FieldKind::Text) => return,
+                        _ => {}
+                    }
                     q.text.push_str(&s);
                     return;
                 }
@@ -3158,15 +3193,18 @@ impl App {
             self.answer_question("accept");
             return;
         };
-        let n = match &field.kind {
-            FieldKind::Single(o) | FieldKind::Multi(o, _) => o.len(),
-            FieldKind::Bool => 2,
-            FieldKind::Text => 0,
-        };
+        let n = field.rows();
+        let opts = field.options().len();
+        let on_other = field.on_other(q.sel);
         let advance = |q: &mut QuestionCard| {
             q.idx += 1;
             q.sel = 0;
             q.text.clear();
+        };
+        // Typing on a choice question goes to its "Other" row.
+        let typed = |q: &mut QuestionCard, c: char| {
+            q.sel = opts;
+            q.text.push(c);
         };
         match k.code {
             KeyCode::Esc => {
@@ -3175,6 +3213,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::BackTab if n > 0 => q.sel = if q.sel == 0 { n - 1 } else { q.sel - 1 },
             KeyCode::Down | KeyCode::Tab if n > 0 => q.sel = (q.sel + 1) % n,
+            KeyCode::Backspace if on_other || matches!(field.kind, FieldKind::Text) => {
+                q.text.pop();
+            }
+            KeyCode::Char(c) if on_other || matches!(field.kind, FieldKind::Text) => q.text.push(c),
             KeyCode::Char(' ') if matches!(field.kind, FieldKind::Multi(..)) => {
                 if let Some(FieldKind::Multi(_, checked)) = q.fields.get_mut(q.idx).map(|f| &mut f.kind) {
                     if let Some(c) = checked.get_mut(q.sel) {
@@ -3184,51 +3226,58 @@ impl App {
             }
             KeyCode::Char(c) if matches!(field.kind, FieldKind::Single(_)) && c.is_ascii_digit() => {
                 let i = c.to_digit(10).unwrap() as usize;
-                if i >= 1 && i <= n {
-                    if let FieldKind::Single(opts) = &field.kind {
-                        q.answers.insert(field.key.clone(), Value::String(opts[i - 1].0.clone()));
-                    }
+                if i >= 1 && i <= opts {
+                    q.answers.insert(field.key.clone(), Value::String(field.options()[i - 1].0.clone()));
                     advance(q);
+                } else if field.other.is_some() {
+                    typed(q, c);
                 }
             }
+            KeyCode::Char(c) if field.other.is_some() && !c.is_control() => typed(q, c),
             KeyCode::Enter => {
+                let text = q.text.trim().to_string();
                 match &field.kind {
-                    FieldKind::Single(opts) => {
-                        if let Some(o) = opts.get(q.sel) {
+                    FieldKind::Single(o) => {
+                        if on_other {
+                            match &field.other {
+                                Some(key) if !text.is_empty() => {
+                                    q.answers.insert(key.clone(), Value::String(text));
+                                }
+                                // Nothing typed: skip the question, unless it must be answered.
+                                _ if field.required => return,
+                                _ => {}
+                            }
+                        } else if let Some(o) = o.get(q.sel) {
                             q.answers.insert(field.key.clone(), Value::String(o.0.clone()));
                         }
                     }
-                    FieldKind::Multi(opts, _) => {
-                        if let Some(FieldKind::Multi(_, checked)) = q.fields.get(q.idx).map(|f| &f.kind) {
-                            let mut vals: Vec<Value> = opts
-                                .iter()
-                                .zip(checked.iter())
-                                .filter(|(_, c)| **c)
-                                .map(|(o, _)| Value::String(o.0.clone()))
-                                .collect();
-                            if vals.is_empty() {
-                                if let Some(o) = opts.get(q.sel) {
-                                    vals.push(Value::String(o.0.clone()));
-                                }
-                            }
+                    FieldKind::Multi(o, checked) => {
+                        // Enter submits exactly what's checked, which may be nothing.
+                        let vals: Vec<Value> =
+                            o.iter().zip(checked).filter(|(_, c)| **c).map(|(o, _)| Value::String(o.0.clone())).collect();
+                        if vals.is_empty() && text.is_empty() && field.required {
+                            return;
+                        }
+                        if !vals.is_empty() {
                             q.answers.insert(field.key.clone(), Value::Array(vals));
+                        }
+                        if let Some(key) = field.other.as_ref().filter(|_| !text.is_empty()) {
+                            q.answers.insert(key.clone(), Value::String(text));
                         }
                     }
                     FieldKind::Bool => {
                         q.answers.insert(field.key.clone(), Value::Bool(q.sel == 0));
                     }
                     FieldKind::Text => {
-                        if !q.text.trim().is_empty() {
-                            q.answers.insert(field.key.clone(), Value::String(q.text.trim().to_string()));
+                        if !text.is_empty() {
+                            q.answers.insert(field.key.clone(), Value::String(text));
+                        } else if field.required {
+                            return;
                         }
                     }
                 }
                 advance(q);
             }
-            KeyCode::Backspace if matches!(field.kind, FieldKind::Text) => {
-                q.text.pop();
-            }
-            KeyCode::Char(c) if matches!(field.kind, FieldKind::Text) => q.text.push(c),
             _ => {}
         }
         if self.question.as_ref().is_some_and(|q| q.idx >= q.fields.len()) {
@@ -3250,12 +3299,21 @@ fn build_question(id: Value, params: &Value) -> Option<QuestionCard> {
     let message = s(params, "message");
     let schema = params.get("requestedSchema")?;
     let props = schema.get("properties")?.as_object()?;
-    let mut fields = Vec::new();
+    let required: Vec<&str> =
+        schema.get("required").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    let mut fields: Vec<Field> = Vec::new();
     for (key, p) in props {
         let title = s(p, "title");
         let description = s(p, "description");
         let ty = s(p, "type");
-        let parse_opts = |arr: &Vec<Value>| -> Vec<(String, String, String)> {
+        let mut previews = Vec::new();
+        let mut parse_opts = |arr: &Vec<Value>| -> Vec<(String, String, String)> {
+            previews = arr
+                .iter()
+                .map(|o| {
+                    o.pointer("/_meta/_claude~1askUserQuestionOption/preview").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                })
+                .collect();
             arr.iter()
                 .map(|o| {
                     let v = o.get("const").and_then(|c| c.as_str()).unwrap_or_default().to_string();
@@ -3294,7 +3352,20 @@ fn build_question(id: Value, params: &Value) -> Option<QuestionCard> {
         } else {
             FieldKind::Text
         };
-        fields.push(Field { key: key.clone(), title, description, kind });
+        // The adapter follows each AskUserQuestion choice with an optional
+        // `<key>_custom` text field ("Other"). Fold it into the choice so the
+        // question is one step, with its own free-text row.
+        if let Some(prev) = fields.last_mut().filter(|prev| {
+            matches!(kind, FieldKind::Text)
+                && prev.other.is_none()
+                && matches!(prev.kind, FieldKind::Single(_) | FieldKind::Multi(..))
+                && *key == format!("{}_custom", prev.key)
+        }) {
+            prev.other = Some(key.clone());
+            continue;
+        }
+        let required = required.contains(&key.as_str());
+        fields.push(Field { key: key.clone(), title, description, kind, previews, other: None, required });
     }
     if fields.is_empty() {
         return None;

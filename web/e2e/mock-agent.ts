@@ -5,6 +5,8 @@
 // depends on the words in it:
 //
 //   "perm"  asks permission to run a command
+//   "quiz"  asks an AskUserQuestion form shaped exactly like claude-agent-acp's
+//           (choices with "<key>_custom" Other boxes and option previews)
 //   "ask"   asks a form question (select, multi-select, text, yes/no)
 //   "slow"  streams for ~8s, so it can be stopped
 //   other   a full turn: thinking, a read, an edit with a diff, a plan,
@@ -168,6 +170,32 @@ async function prompt(sid: string, text: string): Promise<Json> {
       content: [{ type: "content", content: { type: "text", text: ok ? "removed build/" : "Permission denied" } }],
     });
     reply = `Permission answer: ${outcome}`;
+    await say(sid, reply);
+  } else if (lower.includes("quiz")) {
+    const r = await request("elicitation/create", {
+      mode: "form",
+      sessionId: sid,
+      message: "Please answer the following questions.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          question_0: {
+            type: "string",
+            title: "Cache",
+            description: "Which cache?",
+            oneOf: [
+              { const: "Redis", title: "Redis", description: "fast", _meta: { "_claude/askUserQuestionOption": { preview: "redis:\n  port: 6379" } } },
+              { const: "Memcached", title: "Memcached" },
+            ],
+          },
+          question_0_custom: { type: "string", title: "Other", description: "Type your own answer, or add a note to the option you chose above (optional)." },
+          question_1: { type: "array", title: "Extras", description: "Which extras?", items: { anyOf: [{ const: "Lint", title: "Lint" }, { const: "CI", title: "CI" }] } },
+          question_1_custom: { type: "string", title: "Other", description: "Type your own answer to add to your selection above (optional)." },
+        },
+      },
+    });
+    log(`quiz -> ${JSON.stringify(r)}`);
+    reply = `Answer: ${JSON.stringify(r)}`;
     await say(sid, reply);
   } else if (lower.includes("ask")) {
     const r = await request("elicitation/create", {

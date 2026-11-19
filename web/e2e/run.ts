@@ -359,6 +359,24 @@ async function main() {
       assert(txt.includes(want), `missing ${want} in ${txt}`);
   });
 
+  await step("AskUserQuestion: preview, Other-only answer, empty multi-select", async () => {
+    await sendPrompt(page, "quiz me");
+    const card = page.locator("[data-card=question]");
+    await card.waitFor();
+    // Picking Redis shows its preview; Clear takes the pick back.
+    await card.getByText("Redis", { exact: true }).click();
+    await card.locator("[data-preview]").getByText("port: 6379").waitFor();
+    await shot(page, "desktop-09-ask-user-question");
+    await card.getByRole("button", { name: "Clear" }).click();
+    assert((await card.locator("[data-preview]").count()) === 0, "preview still shown after Clear");
+    // Answer with only typed text, leave the multi-select empty; Submit is enabled.
+    await card.locator("input#q-question_0_custom").fill("Valkey 8");
+    await card.getByRole("button", { name: "Submit" }).click();
+    await waitIdle(page);
+    const txt = await lastAgentText(page);
+    assert(txt.includes('{"action":"accept","content":{"question_0_custom":"Valkey 8"}}'), txt);
+  });
+
   await step("question form: Decline", async () => {
     await sendPrompt(page, "ask again");
     await page.locator("[data-card=question]").getByRole("button", { name: "Decline" }).click();

@@ -705,9 +705,61 @@ fn card_lines(app: &App, th: &Theme, w: usize) -> Vec<Line<'static>> {
                 out.push(if sel { crate::text::pad_line(l, w, Style::default()) } else { l });
             }
         };
+        // The "Other" row after the options, where typing goes.
+        let other_line = |out: &mut Vec<Line<'static>>| {
+            if field.other.is_none() {
+                return;
+            }
+            let sel = field.on_other(q.sel);
+            let mut spans = vec![Span::styled(if sel { PROMPT_ARROW } else { "  " }, th.accent())];
+            spans.push(Span::styled(if matches!(field.kind, FieldKind::Multi(..)) { "+ " } else { "   " }, th.muted()));
+            if q.text.is_empty() {
+                spans.push(Span::styled("Other", if sel { th.bold() } else { th.secondary() }));
+                let hint = if !sel || field.required {
+                    "  type your own answer"
+                } else if matches!(field.kind, FieldKind::Multi(..)) {
+                    "  type your own answer, or Enter to submit"
+                } else {
+                    "  type your own answer, or Enter to skip"
+                };
+                spans.push(Span::styled(hint, th.dim()));
+            } else {
+                spans.push(Span::styled(sanitize(&q.text), th.bold()));
+            }
+            if sel {
+                spans.push(Span::styled("▏", th.accent()));
+            }
+            let l = Line::from(spans);
+            out.push(if sel { crate::text::pad_line(l, w, Style::default()) } else { l });
+        };
+        // Preview of the highlighted option (mockups, snippets), above the
+        // options so a clipped card still shows them; kept short.
+        let preview_lines = |out: &mut Vec<Line<'static>>| {
+            let Some(p) = field.previews.get(q.sel).filter(|p| !p.trim().is_empty()) else { return };
+            const MAX: usize = 12;
+            let lines: Vec<&str> = p.trim_end().lines().collect();
+            for l in lines.iter().take(MAX) {
+                out.push(Line::from(vec![
+                    Span::styled("  │ ", th.muted()),
+                    Span::styled(truncate(&sanitize(l), w.saturating_sub(4)), th.secondary()),
+                ]));
+            }
+            if lines.len() > MAX {
+                out.push(Line::from(Span::styled(format!("  │ … {} more lines", lines.len() - MAX), th.dim())));
+            }
+            out.push(Line::default());
+        };
         match &field.kind {
-            FieldKind::Single(o) => opts_lines(o, None, &mut out),
-            FieldKind::Multi(o, c) => opts_lines(o, Some(c), &mut out),
+            FieldKind::Single(o) => {
+                preview_lines(&mut out);
+                opts_lines(o, None, &mut out);
+                other_line(&mut out);
+            }
+            FieldKind::Multi(o, c) => {
+                preview_lines(&mut out);
+                opts_lines(o, Some(c), &mut out);
+                other_line(&mut out);
+            }
             FieldKind::Bool => {
                 let o = vec![("yes".into(), "Yes".into(), String::new()), ("no".into(), "No".into(), String::new())];
                 opts_lines(&o, None, &mut out);
@@ -893,8 +945,17 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         vec![("↑ / Enter", "older match"), ("↓", "newer match"), ("Esc", "close")]
     } else if !app.permissions.is_empty() {
         vec![("↑↓", "select"), ("Enter", "confirm"), ("1-9", "pick"), ("Esc", "deny"), ("Ctrl+C", "stop turn")]
-    } else if app.question.is_some() {
-        vec![("↑↓", "select"), ("Space", "toggle"), ("Enter", "confirm"), ("Esc", "dismiss")]
+    } else if let Some(q) = &app.question {
+        let field = q.fields.get(q.idx);
+        let mut v = vec![("↑↓", "select")];
+        if field.is_some_and(|f| matches!(f.kind, FieldKind::Multi(..))) {
+            v.push(("Space", "toggle"));
+        }
+        if field.is_some_and(|f| f.other.is_some()) {
+            v.push(("type", "own answer"));
+        }
+        v.extend([("Enter", "confirm"), ("Esc", "dismiss")]);
+        v
     } else if app.completion.is_some() {
         vec![("↑↓", "select"), ("Tab", "complete"), ("Enter", "accept"), ("Esc", "close")]
     } else if app.focus == Focus::Scrollback && app.selected_path().is_some() {
