@@ -1019,7 +1019,7 @@ impl App {
             SettingsItem { key: "expand_thinking", label: "Expand thinking", value: onoff(ui.expand_thinking), hint: "new thinking blocks start open" },
             SettingsItem { key: "todo_pane", label: "Todo pane", value: onoff(ui.todo_pane), hint: "Alt+P · Claude's todo list, pinned" },
             SettingsItem { key: "tasks_pane", label: "Tasks pane", value: onoff(ui.tasks_pane), hint: "Ctrl+B · running and queued work" },
-            SettingsItem { key: "notify", label: "Notifications", value: onoff(f.notify), hint: "bell, plus a desktop alert when unfocused" },
+            SettingsItem { key: "notify", label: "Notifications", value: onoff(f.notify), hint: "chime when Claude needs you or finishes" },
             SettingsItem { key: "narrator", label: "Narrator", value: onoff(f.narrator), hint: "read each turn's summary aloud" },
             SettingsItem { key: "sub_meter", label: "Subscription meter", value: onoff(f.sub_meter), hint: "5-hour and weekly limits" },
             SettingsItem { key: "token_meter", label: "Token meter", value: onoff(f.token_meter), hint: "per-turn and session tokens" },
@@ -1108,35 +1108,22 @@ impl App {
 
     // ------------------------------------------------------------ notifications
 
-    /// Claude needs you (permission, question): bell, and a desktop
-    /// notification if blush is in the background.
-    pub(super) fn attention(&mut self, title: &str, body: &str) {
-        if !self.config.features.notify {
-            return;
-        }
-        notify::bell();
-        if self.focused == Some(false) {
-            notify::desktop(title, body);
+    /// Claude needs you (permission, question): play the chime.
+    pub(super) fn attention(&mut self) {
+        if self.config.features.notify {
+            notify::chime();
         }
     }
 
-    /// A turn finished. In the background: bell and desktop notification.
-    /// If the terminal never reports focus: a bell after long turns only.
+    /// A turn finished. In the background: play the chime. If the terminal
+    /// never reports focus: only after long turns.
     pub(super) fn on_turn_finished_notify(&mut self, took: Duration) {
         if !self.config.features.notify {
             return;
         }
         match self.focused {
-            Some(false) => {
-                notify::bell();
-                let last = self.transcript.entries.iter().rev().find_map(|e| match &e.block {
-                    Block::Agent { text } => Some(text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string()),
-                    _ => None,
-                });
-                let body = last.unwrap_or_else(|| format!("Finished in {}", crate::text::human_duration(took)));
-                notify::desktop("Claude finished", &body);
-            }
-            None if took >= Duration::from_secs(20) => notify::bell(),
+            Some(false) => notify::chime(),
+            None if took >= Duration::from_secs(20) => notify::chime(),
             _ => {}
         }
     }

@@ -1390,9 +1390,8 @@ impl App {
                 if title.is_empty() {
                     title = "Permission requested".into();
                 }
-                let what = title.clone();
                 self.permissions.push_back(PermissionCard { id, title, detail, options, sel: 0, shown: Instant::now() });
-                self.attention("Claude needs permission", &what);
+                self.attention();
             }
             "elicitation/create" => {
                 if let Some(card) = build_question(id.clone(), &params) {
@@ -1401,9 +1400,8 @@ impl App {
                     if self.question.is_some() {
                         self.answer_question("cancel");
                     }
-                    let what = card.message.clone();
                     self.question = Some(card);
-                    self.attention("Claude has a question", &what);
+                    self.attention();
                 } else {
                     client.respond(id, json!({"action": "cancel"}));
                 }

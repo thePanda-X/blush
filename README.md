@@ -373,11 +373,12 @@ opens a chooser.
 
 ### Notifications
 
-When Claude needs a permission or an answer, blush rings the terminal bell. When a turn finishes
-or Claude needs you while the terminal is in the background, you also get a desktop notification:
-a toast on Windows, Notification Center on macOS, `notify-send` on Linux. blush knows the terminal
-is in the background from focus reports. If your terminal doesn't send them, you get a bell after
-turns longer than 20 seconds instead. Turn all of it off with `features.notify = false` or in
+When Claude needs a permission or an answer, blush plays a little "too-tah" chime
+([`sound/too-tah.wav`](sound/too-tah.wav), built into the binary). It also plays when a turn
+finishes while the terminal is in the background. blush knows the terminal is in the background
+from focus reports. If your terminal doesn't send them, the chime plays after turns longer than
+20 seconds instead. On macOS it uses `afplay`; on Linux `paplay` or `aplay`. Turn it off with
+`features.notify = false` or in
 settings (`F2`).
 
 ### `/after`
@@ -437,7 +438,7 @@ narrator = false      # spoken turn summaries (toggle with /narrator)
 sub_meter = true      # 5-hour / weekly subscription meter
 token_meter = true    # per-turn and session token counts
 timeline = true       # Time Machine snapshots after each turn
-notify = true         # bell + desktop notification when Claude finishes or needs you
+notify = true         # chime when Claude finishes or needs you
 
 [update]
 auto = true                  # check GitHub on launch and self-update
@@ -490,7 +491,7 @@ default mode instead.
 | [`src/usage.rs`](src/usage.rs) | Parses `/usage` into the subscription meter, and reads per-turn token usage from prompt responses. |
 | [`src/narrator.rs`](src/narrator.rs), [`src/peek.rs`](src/peek.rs) | Text-to-speech summaries, and opening or revealing files. |
 | [`src/app/extras.rs`](src/app/extras.rs) | The command palette, find, stash, send-now, queue editing, shell mode, `/btw`, `/rename`, density, the panes, settings, and notifications. |
-| [`src/attach.rs`](src/attach.rs), [`src/shell.rs`](src/shell.rs), [`src/notify.rs`](src/notify.rs) | Image and long-paste attachments, running `!` commands, and the bell and desktop notifications. |
+| [`src/attach.rs`](src/attach.rs), [`src/shell.rs`](src/shell.rs), [`src/notify.rs`](src/notify.rs) | Image and long-paste attachments, running `!` commands, and the notification chime. |
 | [`src/update.rs`](src/update.rs), [`build.rs`](build.rs) | The self-updater: compares the build's git commit with GitHub, rebuilds from source, swaps the binary, and plays the update animation. |
 
 ## Troubleshooting
