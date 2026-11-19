@@ -311,6 +311,8 @@ pub struct App {
     pub follow: bool,
 
     pub tick: u64,
+    /// `repo:branch` shown in the header when cwd is inside a git repo.
+    pub git_label: Option<String>,
     pub quit_armed: Option<Instant>,
     /// Scroll offset of the shortcuts overlay (it's taller than most terminals).
     pub shortcuts_scroll: usize,
@@ -419,6 +421,7 @@ impl App {
         }
         let mut input = Input::default();
         input.load_history(load_history());
+        let git_label = crate::ui::git_label(&cwd);
         App {
             files: FileIndex::spawn(cwd.clone()),
             theme,
@@ -461,6 +464,7 @@ impl App {
             scroll: 0,
             follow: true,
             tick: 0,
+            git_label,
             quit_armed: None,
             shortcuts_scroll: 0,
             queue_paused: false,

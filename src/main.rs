@@ -289,6 +289,14 @@ async fn run_tui(
                         // Once a minute: keep the subscription meter fresh while idle.
                         app.maybe_refresh_usage();
                     }
+                    if app.tick % 40 == 0 {
+                        // Every 2s: pick up branch switches for the header.
+                        let label = crate::ui::git_label(&app.cwd);
+                        if label != app.git_label {
+                            app.git_label = label;
+                            app.dirty = true;
+                        }
+                    }
                     let toast_live = app.toast.as_ref().is_some_and(|(_, t)| t.elapsed() < Duration::from_millis(2700));
                     // Every 6s: the subscription meter alternates 5h / weekly.
                     let meter_flip = app.tick % 120 == 0 && !app.limits.is_empty();

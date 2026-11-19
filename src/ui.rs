@@ -102,7 +102,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 // ---------------------------------------------------------------- header
 
 fn draw_header(f: &mut Frame, app: &App, th: &Theme, r: Rect) {
-    let cwd = display_path(&app.cwd);
+    let cwd = app.git_label.clone().unwrap_or_else(|| display_path(&app.cwd));
     let right = if app.session.size > 0 {
         format!("{} / {}", human_tokens(app.session.used), human_tokens(app.session.size))
     } else {
@@ -137,6 +137,35 @@ pub fn display_path(p: &std::path::Path) -> String {
         }
     }
     s.replace('\\', "/")
+}
+
+/// `repo:branch` if `cwd` is inside a git repo. Reads `.git/HEAD` directly
+/// (no subprocess) so it's cheap enough to poll. Handles worktrees/submodules
+/// (`.git` file with `gitdir:`) and detached HEAD (short sha).
+pub fn git_label(cwd: &std::path::Path) -> Option<String> {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        let dot = d.join(".git");
+        let git_dir = if dot.is_dir() {
+            dot
+        } else if dot.is_file() {
+            let s = std::fs::read_to_string(&dot).ok()?;
+            let p = std::path::PathBuf::from(s.trim().strip_prefix("gitdir:")?.trim());
+            if p.is_absolute() { p } else { d.join(p) }
+        } else {
+            dir = d.parent();
+            continue;
+        };
+        let name = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| display_path(d));
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let head = head.trim();
+        let branch = match head.strip_prefix("ref:") {
+            Some(r) => r.trim().strip_prefix("refs/heads/").unwrap_or(r.trim()).to_string(),
+            None => head.chars().take(7).collect(),
+        };
+        return Some(format!("{name}:{branch}"));
+    }
+    None
 }
 
 // ---------------------------------------------------------------- scrollback
@@ -1369,5 +1398,15 @@ mod tests {
         app.shortcuts_scroll = app.layout.shortcuts_max;
         let end = screen(&mut app, 100, 30);
         assert!(end.contains("/narrator"), "{end}");
+    }
+}
+
+#[cfg(test)]
+mod git_label_tests {
+    #[test]
+    fn labels_this_repo() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let label = super::git_label(&here).expect("inside a git repo");
+        assert!(label.starts_with("blush:"), "{label}");
     }
 }
