@@ -135,6 +135,15 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `Shift+←` / `Shift+→` | Jump between turns |
 | `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks (and, in compact mode, all groups) |
 | `Ctrl+G` | Toggle the compact layout |
+| `Alt+↑` / `Alt+↓` | Jump between turns from anywhere, including the prompt |
+| `Ctrl+N` / `Ctrl+R` | New session / resume a session |
+| `Ctrl+P` · `Alt+E` · `Alt+M` | Pick the model / effort / permission mode |
+| `Ctrl+T` | Pick a theme |
+| `Ctrl+Y` / `Alt+X` | Copy the last response / export the transcript |
+| `Alt+C` | Commit (`/commit`) |
+| `Alt+T` · `Alt+Z` · `Alt+Shift+Z` | Time Machine: timeline / undo / redo |
+| `Alt+K` | Show context usage |
+| `Alt+H` · `Alt+S` · `Alt+N` | Toggle thinking blocks / timestamps / narrator |
 | `PgUp` / `PgDn`, mouse wheel | Scroll |
 | Click | Click a block to select it; click its header to fold it |
 | `Ctrl+.` / `F1` | Show all shortcuts |

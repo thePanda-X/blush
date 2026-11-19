@@ -287,6 +287,9 @@ pub struct App {
     pub continue_latest: bool,
     pub pick_session: bool,
     pub pending_prompt: Option<String>,
+    /// `session/update`s that arrived for a not-yet-known session while a
+    /// `session/new` was in flight; replayed once its id is known.
+    pub early_updates: Vec<(String, Value)>,
 }
 
 pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
@@ -388,6 +391,7 @@ impl App {
             continue_latest: false,
             pick_session: false,
             pending_prompt: None,
+            early_updates: Vec::new(),
             config,
         }
     }
@@ -506,6 +510,15 @@ impl App {
         let Some(client) = self.client.clone() else { return };
         let tx = self.tx.clone();
         let cwd = self.cwd.to_string_lossy().to_string();
+        // Updates race the open reply (they arrive on a different task), so
+        // switch to the target session now: a load's history replay must not be
+        // filtered out as "some other session". For a new session the id isn't
+        // known yet — unknown-session updates are buffered until it is.
+        self.early_updates.clear();
+        self.session.id = match &kind {
+            SessionKind::New => None,
+            SessionKind::Load(id) | SessionKind::Resume(id) => Some(id.clone()),
+        };
         let (method, params) = match &kind {
             SessionKind::New => ("session/new", json!({"cwd": cwd, "mcpServers": []})),
             SessionKind::Load(id) => ("session/load", json!({"sessionId": id, "cwd": cwd, "mcpServers": []})),
@@ -642,6 +655,14 @@ impl App {
                 self.conn = Conn::Ready;
                 let prior_cmds = std::mem::take(&mut self.session.commands);
                 self.session.apply_new_session(&result);
+                if let SessionKind::Load(id) | SessionKind::Resume(id) = &kind {
+                    self.session.id = Some(id.clone());
+                }
+                for (sid, u) in std::mem::take(&mut self.early_updates) {
+                    if Some(sid.as_str()) == self.session.id.as_deref() {
+                        self.apply_session_update(&u);
+                    }
+                }
                 if self.session.commands.is_empty() {
                     self.session.commands = prior_cmds;
                 }
@@ -677,6 +698,7 @@ impl App {
                 self.maybe_refresh_usage();
             }
             AppMsg::SessionFailed(e) => {
+                self.early_updates.clear();
                 self.conn = Conn::Failed(e.clone());
                 self.transcript.notice(Level::Error, format!("Couldn't open session: {e}"));
             }
@@ -1046,6 +1068,16 @@ impl App {
         true
     }
 
+    fn apply_session_update(&mut self, u: &Value) {
+        let fx = self.transcript.apply_update(&mut self.session, u);
+        if self.responding {
+            self.turn_chars += fx.output_chars;
+        }
+        if fx.title_changed {
+            self.update_title();
+        }
+    }
+
     async fn on_incoming(&mut self, inc: Incoming) {
         match inc {
             Incoming::Notification { method, params } => {
@@ -1053,23 +1085,26 @@ impl App {
                     // The `/usage` probe's session: capture its reply, ignore the rest.
                     let update_sid = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                     if !update_sid.is_empty() && Some(update_sid) != self.session.id.as_deref() {
-                        if let (Some((probe, buf)), Some(u)) = (self.usage_probe.as_mut(), params.get("update")) {
-                            if probe == update_sid && s(u, "sessionUpdate") == "agent_message_chunk" {
-                                if let Some(t) = u.get("content").and_then(crate::model::content_text) {
-                                    buf.push_str(&t);
+                        let Some(u) = params.get("update") else { return };
+                        match self.usage_probe.as_mut() {
+                            Some((probe, buf)) if probe == update_sid => {
+                                if s(u, "sessionUpdate") == "agent_message_chunk" {
+                                    if let Some(t) = u.get("content").and_then(crate::model::content_text) {
+                                        buf.push_str(&t);
+                                    }
                                 }
                             }
+                            // A `session/new` is in flight and its reply hasn't been
+                            // processed yet: this may be the new session's first output.
+                            _ if self.session.id.is_none() && self.early_updates.len() < 10_000 => {
+                                self.early_updates.push((update_sid.to_string(), u.clone()));
+                            }
+                            _ => {}
                         }
                         return;
                     }
                     if let Some(u) = params.get("update") {
-                        let fx = self.transcript.apply_update(&mut self.session, u);
-                        if self.responding {
-                            self.turn_chars += fx.output_chars;
-                        }
-                        if fx.title_changed {
-                            self.update_title();
-                        }
+                        self.apply_session_update(u);
                     }
                 }
             }
@@ -2315,6 +2350,19 @@ impl App {
             self.force_redraw = true;
             return;
         }
+        if let Some(cmd) = Self::command_shortcut(&k, ctrl, alt) {
+            self.completion = None;
+            self.run_local(cmd, "").await;
+            return;
+        }
+        // Turn navigation from anywhere: Alt+↑ / Alt+↓
+        if alt && matches!(k.code, KeyCode::Up | KeyCode::Down) {
+            if self.focus == Focus::Prompt {
+                self.focus = Focus::Scrollback;
+            }
+            self.jump_turn(k.code == KeyCode::Down);
+            return;
+        }
         match k.code {
             KeyCode::PageUp => {
                 let h = self.layout.view_height.max(4) as isize;
@@ -2333,6 +2381,38 @@ impl App {
             Focus::Scrollback => self.on_scrollback_key(k, ctrl, shift).await,
             Focus::Prompt => self.on_prompt_key(k, ctrl, alt, shift).await,
         }
+    }
+
+    /// Global key → local slash command. Kept in sync with the shortcut overlay in ui.rs.
+    fn command_shortcut(k: &KeyEvent, ctrl: bool, alt: bool) -> Option<&'static str> {
+        let KeyCode::Char(c) = k.code else { return None };
+        if ctrl && !alt {
+            return match c.to_ascii_lowercase() {
+                'n' => Some("new"),
+                'r' => Some("resume"),
+                'p' => Some("model"),
+                't' => Some("theme"),
+                'y' => Some("copy"),
+                _ => None,
+            };
+        }
+        if alt && !ctrl {
+            return match c {
+                'm' => Some("mode"),
+                'e' => Some("effort"),
+                'c' => Some("commit"),
+                't' => Some("timeline"),
+                'z' => Some("undo"),
+                'Z' => Some("redo"),
+                'x' => Some("export"),
+                'k' => Some("context"),
+                'h' => Some("thinking"),
+                's' => Some("timestamps"),
+                'n' => Some("narrator"),
+                _ => None,
+            };
+        }
+        None
     }
 
     async fn on_scrollback_key(&mut self, k: KeyEvent, ctrl: bool, shift: bool) {
