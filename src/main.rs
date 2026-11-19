@@ -14,6 +14,7 @@ mod text;
 mod theme;
 mod timeline;
 mod ui;
+mod update;
 mod usage;
 
 use std::io::{self, Write};
@@ -37,7 +38,7 @@ use app::{App, AppMsg, External, SessionKind};
 use config::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "blush", version, about = "A Grok-Build-style coding agent TUI for Claude Code (via ACP)")]
+#[command(name = "blush", version = env!("BLUSH_VERSION"), about = "A Grok-Build-style coding agent TUI for Claude Code (via ACP)")]
 struct Cli {
     /// Initial prompt to send once the session is ready.
     prompt: Option<String>,
@@ -77,16 +78,35 @@ struct Cli {
     /// Reinstall the Claude Code ACP adapter at its latest version and exit.
     #[arg(long)]
     update_adapter: bool,
+
+    /// Update blush to the latest commit on GitHub and exit.
+    #[arg(long)]
+    update: bool,
+
+    /// Skip the launch-time update check for this run.
+    #[arg(long)]
+    no_update: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = Config::load();
+    if cli.update {
+        std::process::exit(update::run_now(&config.update));
+    }
+    // Interactive launches only: never stall scripts (-p) with a rebuild.
+    if cli.print.is_none()
+        && !cli.update_adapter
+        && !cli.no_update
+        && let Some(code) = update::on_launch(&config.update)
+    {
+        std::process::exit(code);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(run(cli))
+    rt.block_on(run(cli, config))
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    let mut config = Config::load();
+async fn run(cli: Cli, mut config: Config) -> Result<()> {
     if let Some(t) = &cli.theme {
         if theme::Theme::by_name(t).is_none() {
             let names: Vec<&str> = theme::THEME_NAMES.iter().map(|(n, _)| *n).collect();

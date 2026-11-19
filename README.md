@@ -101,6 +101,22 @@ blush
 
 </details>
 
+### Updates
+
+blush keeps itself up to date. Each time you open it, it asks GitHub whether `main` has moved past
+the commit your binary was built from. If it has, blush fetches the new source into `~/.blush/src`,
+rebuilds it with cargo, swaps the binary in place, and relaunches with the same arguments. A
+full-screen progress animation runs while it works. The first update compiles from scratch, so
+expect a minute or two. Later updates are incremental.
+
+- Press `Esc` during the fetch or compile to skip that update and open your current version.
+- If anything fails, blush launches the version you already have. The details go to
+  `~/.blush/logs/update.log`.
+- Dev builds are never replaced automatically. That covers debug builds, builds from a dirty
+  tree, and commits GitHub doesn't know about.
+- Run `blush --update` to update right away, or `blush --no-update` (or `BLUSH_NO_UPDATE=1`) to skip
+  the check for one run. To turn it off for good, set `update.auto = false`.
+
 ## Usage
 
 ```sh
@@ -114,6 +130,8 @@ blush --cwd ../other-project       # run the agent in another directory
 blush --mode plan --model sonnet --theme night
 blush --no-mouse                   # keep your terminal's native selection
 blush --update-adapter             # reinstall the latest Claude Code ACP adapter
+blush --update                     # update blush itself to the latest commit and exit
+blush --no-update                  # skip the launch-time update check once
 ```
 
 When you quit, blush prints a `blush --resume <id>` line so you can return to the session later.
@@ -321,6 +339,11 @@ narrator = false      # spoken turn summaries (toggle with /narrator)
 sub_meter = true      # 5-hour / weekly subscription meter
 token_meter = true    # per-turn and session token counts
 timeline = true       # Time Machine snapshots after each turn
+
+[update]
+auto = true                  # check GitHub on launch and self-update
+repo = "thePanda-X/blush"    # where updates come from
+branch = "main"
 ```
 
 > **Bring your own agent.** blush speaks plain ACP, so setting `agent.command` and `agent.args` lets
@@ -334,6 +357,8 @@ timeline = true       # Time Machine snapshots after each turn
 | `~/.blush/history` | Prompt history |
 | `~/.blush/logs/agent.log` | The adapter's stderr, which is the first place to look when something goes wrong |
 | `~/.blush/adapter/` | The npm install of the ACP adapter that blush manages |
+| `~/.blush/src/` | The source checkout that self-updates build from |
+| `~/.blush/logs/update.log` | Output from failed self-updates |
 
 ### About bypass mode
 
@@ -364,6 +389,7 @@ default mode instead.
 | [`src/timeline.rs`](src/timeline.rs) | The Time Machine: snapshots in a private git index, and restores that only touch the paths that changed. |
 | [`src/usage.rs`](src/usage.rs) | Parses `/usage` into the subscription meter, and reads per-turn token usage from prompt responses. |
 | [`src/narrator.rs`](src/narrator.rs), [`src/peek.rs`](src/peek.rs) | Text-to-speech summaries, and opening or revealing files. |
+| [`src/update.rs`](src/update.rs), [`build.rs`](build.rs) | The self-updater: compares the build's git commit with GitHub, rebuilds from source, swaps the binary, and plays the update animation. |
 
 ## Troubleshooting
 

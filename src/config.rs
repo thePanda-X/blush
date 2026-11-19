@@ -12,6 +12,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub features: FeaturesConfig,
+    pub update: UpdateConfig,
     /// Set when the file existed but couldn't be parsed (shown in the TUI,
     /// where a plain stderr line would vanish behind the alternate screen).
     #[serde(skip)]
@@ -34,6 +35,24 @@ pub struct FeaturesConfig {
 impl Default for FeaturesConfig {
     fn default() -> Self {
         FeaturesConfig { narrator: false, sub_meter: true, token_meter: true, timeline: true }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// On launch, check GitHub for a newer blush and rebuild / swap in place.
+    /// (`--no-update` or BLUSH_NO_UPDATE=1 skips it for one run.)
+    pub auto: bool,
+    /// GitHub repository to update from, as "owner/name".
+    pub repo: String,
+    /// Branch to track.
+    pub branch: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig { auto: true, repo: "thePanda-X/blush".into(), branch: "main".into() }
     }
 }
 
@@ -112,7 +131,7 @@ impl Default for AgentConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default(), load_warning: None }
+        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default(), update: UpdateConfig::default(), load_warning: None }
     }
 }
 
