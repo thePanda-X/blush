@@ -64,6 +64,8 @@ pub enum Block {
     Notice { level: Level, text: String },
     /// End-of-turn marker for cancelled / failed turns.
     TurnEnd { reason: String },
+    /// A `/btw` side question, answered in a throwaway fork of the session.
+    Aside { question: String, answer: String, started: Instant, ended: Option<Duration>, failed: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub struct Entry {
     pub cache: std::cell::RefCell<Option<RenderCache>>,
     /// Compact mode: whether the group this entry anchors is expanded.
     pub group_open: bool,
+    /// Show a response's markdown source instead of rendering it.
+    pub raw: bool,
 }
 
 #[allow(dead_code)]
@@ -99,7 +103,7 @@ impl Entry {
             Block::Tool(_) => Fold::Collapsed,
             _ => Fold::Expanded,
         };
-        Entry { block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false }
+        Entry { block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false, raw: false }
     }
 
     pub fn touch(&mut self) {
@@ -119,6 +123,7 @@ impl Entry {
         match &self.block {
             Block::Thought { ended, .. } => ended.is_none(),
             Block::Tool(t) => matches!(t.status, ToolStatus::Pending | ToolStatus::Running),
+            Block::Aside { ended, .. } => ended.is_none(),
             _ => false,
         }
     }
@@ -150,8 +155,16 @@ impl Entry {
                 .join("\n"),
             Block::Notice { text, .. } => text.clone(),
             Block::TurnEnd { reason } => reason.clone(),
+            Block::Aside { question, answer, .. } => format!("btw: {question}
+
+{answer}"),
         }
     }
+}
+
+/// Whether a tool call changes files (an edit, a move, or anything with a diff).
+pub fn is_edit(t: &ToolCall) -> bool {
+    matches!(t.kind.as_str(), "edit" | "delete" | "move") || t.content.iter().any(|c| matches!(c, ToolContent::Diff { .. }))
 }
 
 pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -386,6 +399,10 @@ pub struct Transcript {
     pub last_activity: Instant,
     pub show_thinking: bool,
     pub expand_thinking: bool,
+    /// Density "detailed": new tool calls start expanded.
+    pub expand_tools: bool,
+    /// Density "diff focus": edits stay out of compact groups, so their diffs show.
+    pub diff_focus: bool,
     /// Replaying a `/usage` exchange blush ran in the background: skip it.
     pub skipping_usage: bool,
 }
@@ -399,6 +416,8 @@ impl Transcript {
             last_activity: Instant::now(),
             show_thinking: true,
             expand_thinking: false,
+            expand_tools: false,
+            diff_focus: false,
             skipping_usage: false,
         }
     }
@@ -407,6 +426,9 @@ impl Transcript {
         self.close_thoughts();
         let mut e = Entry::new(block);
         if matches!(e.block, Block::Thought { .. }) && self.expand_thinking {
+            e.fold = Fold::Expanded;
+        }
+        if matches!(e.block, Block::Tool(_)) && self.expand_tools {
             e.fold = Fold::Expanded;
         }
         self.entries.push(e);
@@ -439,7 +461,8 @@ impl Transcript {
             if thought && !self.show_thinking {
                 continue;
             }
-            if thought || matches!(e.block, Block::Tool(_)) {
+            let groupable_tool = matches!(&e.block, Block::Tool(t) if !(self.diff_focus && is_edit(t)));
+            if thought || groupable_tool {
                 run = Some(match run {
                     Some((first, _, n)) => (first, i, n + 1),
                     None => (i, i, 1),
@@ -458,13 +481,21 @@ impl Transcript {
         out
     }
 
+    /// The most recent plan (Claude Code's todo list), if any.
+    pub fn latest_plan(&self) -> Option<&[PlanItem]> {
+        self.entries.iter().rev().find_map(|e| match &e.block {
+            Block::Plan(items) if !items.is_empty() => Some(items.as_slice()),
+            _ => None,
+        })
+    }
+
     /// Members of a group that are actually shown (skips hidden thinking).
     pub fn group_members(&self, (start, end): (usize, usize)) -> Vec<&Entry> {
         self.entries[start..end]
             .iter()
-            .filter(|e| match e.block {
+            .filter(|e| match &e.block {
                 Block::Thought { .. } => self.show_thinking,
-                Block::Tool(_) => true,
+                Block::Tool(t) => !(self.diff_focus && is_edit(t)),
                 _ => false,
             })
             .collect()
@@ -481,6 +512,10 @@ impl Transcript {
         self.close_thoughts();
         for e in self.entries.iter_mut() {
             if let Block::Tool(t) = &mut e.block {
+                // blush's own `!` commands run independently of turns.
+                if t.id.starts_with("blush:") {
+                    continue;
+                }
                 if matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
                     t.status = if cancelled { ToolStatus::Failed } else { ToolStatus::Done };
                     t.ended.get_or_insert(t.started.elapsed());

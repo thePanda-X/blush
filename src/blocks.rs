@@ -62,10 +62,20 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
             lines.push(Line::default());
             Rendered { lines, band: true, header_rows: 0 }
         }
+        Block::Agent { text } if entry.raw => {
+            // `m` in the scrollback: the markdown source, as Claude wrote it.
+            let style = Style::default().fg(th.gray_bright);
+            let mut lines = Vec::new();
+            for l in text.trim_end().lines() {
+                lines.extend(hard_wrap(vec![Span::styled(sanitize(l), style)], w.saturating_sub(10), vec![]));
+            }
+            Rendered { lines, band: false, header_rows: 0 }
+        }
         Block::Agent { text } => {
             let lines = markdown::render(text, w.saturating_sub(10), th);
             Rendered { lines, band: false, header_rows: 0 }
         }
+        Block::Aside { question, answer, started, ended, failed } => aside(question, answer, *started, *ended, *failed, ctx),
         Block::Thought { text, started, ended } => {
             let mut header = vec![bullet(th, ctx.tick, ended.is_none(), false, th.accent_thinking)];
             match ended {
@@ -124,6 +134,42 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
             header_rows: 0,
         },
     }
+}
+
+/// A `/btw` side question and its answer, set apart from the main thread.
+fn aside(
+    question: &str,
+    answer: &str,
+    started: std::time::Instant,
+    ended: Option<std::time::Duration>,
+    failed: bool,
+    ctx: &Ctx,
+) -> Rendered {
+    let th = ctx.theme;
+    let w = ctx.width.max(10);
+    let live = ended.is_none();
+    let mut header = vec![bullet(th, ctx.tick, live, failed, th.info), Span::styled("btw ", Style::default().fg(th.info).add_modifier(Modifier::BOLD))];
+    let meta = match ended {
+        Some(d) => format!("  {}", human_duration(d)),
+        None => format!("  answering… {}", human_duration(started.elapsed())),
+    };
+    let q = sanitize(question.lines().next().unwrap_or(""));
+    header.push(Span::styled(truncate(&q, w.saturating_sub(8 + crate::text::width(&meta))), th.secondary()));
+    header.push(Span::styled(meta, th.dim()));
+    let mut lines = vec![Line::from(header)];
+    if !answer.trim().is_empty() {
+        let body = if failed {
+            wrap_spans(vec![Span::styled(sanitize(answer.trim()), Style::default().fg(th.error))], w.saturating_sub(2), vec![], vec![])
+        } else {
+            markdown::render(answer.trim(), w.saturating_sub(12), th)
+        };
+        let rail = Style::default().fg(blend(th.bg, th.info, 0.6));
+        for mut l in body {
+            l.spans.insert(0, Span::styled("│ ", rail));
+            lines.push(l);
+        }
+    }
+    Rendered { lines, band: false, header_rows: 0 }
 }
 
 fn bullet(th: &Theme, tick: u64, live: bool, failed: bool, live_color: ratatui::style::Color) -> Span<'static> {

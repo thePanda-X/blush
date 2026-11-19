@@ -30,11 +30,14 @@ pub struct FeaturesConfig {
     pub token_meter: bool,
     /// Snapshot the git working tree after each turn (/timeline, /undo, /redo).
     pub timeline: bool,
+    /// Ring the bell when Claude finishes or needs you, plus a desktop
+    /// notification while the terminal is in the background.
+    pub notify: bool,
 }
 
 impl Default for FeaturesConfig {
     fn default() -> Self {
-        FeaturesConfig { narrator: false, sub_meter: true, token_meter: true, timeline: true }
+        FeaturesConfig { narrator: false, sub_meter: true, token_meter: true, timeline: true, notify: true }
     }
 }
 
@@ -77,6 +80,16 @@ pub struct UiConfig {
     /// Compact layout: runs of tool calls and thinking collapse into one
     /// summary line between responses (Ctrl+G or /compact-mode toggles).
     pub compact: bool,
+    /// Timestamps on prompts only, not on replies (`/timestamps minimal`).
+    pub timestamps_minimal: bool,
+    /// New tool calls start expanded (`/density detailed`).
+    pub expand_tools: bool,
+    /// Keep edits out of compact groups so their diffs stay visible (`/density diff`).
+    pub diff_focus: bool,
+    /// Pin Claude's todo list above the prompt while it has open items (Alt+P).
+    pub todo_pane: bool,
+    /// Show running tools, background commands and queued prompts above the prompt (Ctrl+B).
+    pub tasks_pane: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,6 +124,11 @@ impl Default for UiConfig {
             expand_thinking: false,
             animations: true,
             compact: false,
+            timestamps_minimal: false,
+            expand_tools: false,
+            diff_focus: false,
+            todo_pane: true,
+            tasks_pane: false,
         }
     }
 }

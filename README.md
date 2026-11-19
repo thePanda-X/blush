@@ -144,14 +144,26 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | Key | Action |
 |---|---|
 | `Enter` | Send. If Claude is still responding, the prompt is queued. |
+| `Ctrl+Enter` while Claude responds | Send now: stop the turn and send this prompt next (queued prompts follow; nothing is held) |
 | `Shift+Enter` · `Alt+Enter` · `Ctrl+J` · `\` + `Enter` | New line |
 | `Shift+Tab` | Cycle permission mode: always-approve → ask → accept-edits → plan → auto |
 | `Ctrl+C` | First press stops the response, the next clears the prompt, and pressing twice on an empty prompt quits. If you stop a turn with prompts queued, they're held: `Enter` sends them, `Ctrl+C` drops them |
 | `Ctrl+D` on an empty prompt | Quit (press twice while Claude is working) |
 | `↑` / `↓` in the prompt | Move between lines, then through prompt history |
+| `↑` on an empty prompt with prompts queued | Pull the last queued prompt back into the editor. `Enter` queues it again, `Ctrl+C` drops it |
+| `Esc` `Esc` | Clear the prompt. On an empty prompt, open the Time Machine to rewind files |
+| `Ctrl+S` | Stash the prompt (and its attachments). On an empty prompt, bring it back |
+| `!` at the start of the prompt | Shell mode: run the line in your shell (see [Shell mode](#shell-mode)) |
+| `Alt+V` | Attach the clipboard's image (see [Attachments](#attachments)) |
 | `Tab` on an empty prompt | Move focus to the scrollback |
 | `↑` `↓` · `←` `→` · `Enter` · `y` | In the scrollback: select an entry, fold or unfold it, open it in the viewer, copy it |
 | `o` / `r` | In the scrollback: open the selected tool's file, or reveal it in Explorer / Finder |
+| `Y` · `m` | In the scrollback: copy a tool's command or path · show a response's markdown source |
+| `j` `k` · `g` `G` · `Ctrl+U` `Ctrl+D` | In the scrollback: select · top and bottom · half a page up and down |
+| `Ctrl+F` · `/` in the scrollback | Find in the scrollback. `↑` / `Enter` older match, `↓` newer, `Esc` closes |
+| `Ctrl+X` · `?` in the scrollback | Command palette: every command, fuzzy-searchable, with its shortcut |
+| `F2` | Settings |
+| `Alt+P` · `Ctrl+B` | Toggle the todo pane · the tasks pane |
 | `Shift+←` / `Shift+→` | Jump between turns |
 | `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks (and, in compact mode, all groups) |
 | `Ctrl+G` | Toggle the compact layout |
@@ -183,14 +195,23 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `/theme` (`/t`) | Change the theme |
 | `/copy` · `/export` | Copy the last answer, or export the transcript as Markdown |
 | `/context` · `/session-info` | Show context usage and cost, or session, model, and adapter details |
-| `/thinking` · `/timestamps` | Toggle thinking blocks or timestamps |
+| `/copy 2` | Copy the second-latest answer (any N) |
+| `/thinking` | Toggle thinking blocks |
+| `/timestamps [on\|minimal\|off]` | Clock times on every entry, on prompts only, or nowhere. No argument toggles |
+| `/density [detailed\|balanced\|diff\|grouped]` | How much of each tool call shows (see [Density](#density)). No argument opens a chooser |
 | `/restart` | Restart the agent process |
 | `/login` | Run `claude auth login` without leaving blush |
-| `/config` | Show where the config file is |
+| `/settings` (`/config`) | Open the settings modal (`F2`) |
 | `/shortcuts` (`/help`, `/keys`) | Show the shortcut overlay |
 | `/commit` | Commit your changes as Conventional Commits, on Haiku |
 | `/timeline` · `/undo` · `/redo` | Browse and restore Time Machine snapshots |
 | `/after <task>` | Queue a task to run once Claude finishes |
+| `/btw <question>` | Ask a side question without interrupting (see [`/btw`](#btw)) |
+| `/rename <title>` | Name the session. The name shows in the header, the terminal title, and `/resume` |
+| `/find [text]` | Find in the scrollback (`Ctrl+F`) |
+| `/queue` · `/tasks` | List queued prompts · list running tools, background commands, and queued work |
+| `/stash` | Stash the prompt, or bring it back (`Ctrl+S`) |
+| `/todos` · `/tasks-pane` | Toggle the todo pane (`Alt+P`) · the tasks pane (`Ctrl+B`) |
 | `/narrator` | Turn spoken turn summaries on or off |
 | `/compact-mode` | Toggle the compact layout (same as `Ctrl+G`) |
 | `/quit` (`/exit`, `/q`) | Quit |
@@ -287,6 +308,78 @@ file's name, type, size, and how long ago it was modified. Press `o` to open the
 default app, or `r` to reveal it in Explorer / Finder / your file manager. Scripts and executables
 (`.js`, `.bat`, `.ps1`, `.exe`, …) are always revealed, never run.
 
+### Shell mode
+
+Start a prompt with **`!`** to run it in your own shell in the project directory, without asking
+Claude. That's PowerShell on Windows (`pwsh` if it's installed), and `$SHELL` elsewhere. The prompt
+turns into a shell line as soon as you type the `!`.
+
+```
+! cargo test -p parser
+```
+
+The command and its output appear in the scrollback like any tool call. `Ctrl+C` stops it. The
+output (up to 30,000 characters, trimmed in the middle) is saved, and goes to Claude ahead of your
+next prompt. The prompt box shows `+1 shell output` until then. So you can run something, then
+just ask "why did that fail?".
+
+### `/btw`
+
+`/btw <question>` asks something on the side while Claude keeps working. blush forks the session,
+so the answer knows the conversation, and asks the question in the fork. The answer streams into
+its own `btw` block, and then the fork is deleted. Nothing is added to your session. The fork runs
+in ask mode, and blush refuses anything it asks permission for, so it can read but can't change
+files or run commands.
+
+### Find, palette, stash
+
+- **`Ctrl+F`** (or `/` in the scrollback, or `/find text`) searches every entry, including folded
+  tool output and grouped blocks, which open to show the match. The newest match is selected first.
+- **`Ctrl+X`** (or `?` in the scrollback) opens the command palette, with every blush and Claude
+  Code command and the key that runs it.
+- **`Ctrl+S`** sets the prompt aside. On an empty prompt it brings it back, and on a full one it
+  swaps the two.
+
+### Attachments
+
+- **Images.** `Alt+V` attaches the clipboard's image (a screenshot, say) as `[Image #1]`.
+  Dragging an image file into the terminal does the same. On macOS and Linux, so does pasting when
+  the clipboard holds only an image. On Windows, use `Alt+V`, because the terminal pastes nothing in
+  that case. PNG, JPEG, GIF, and WebP files up to about 3.7 MB are accepted. Delete the placeholder
+  to drop the image.
+- **Long pastes** (12 lines or more, or 1,500 characters) collapse into a
+  `[Pasted text #2 +40 lines]` placeholder, so the prompt box stays readable. The full text is sent.
+
+### Density
+
+`/density` sets how much of each tool call you see. It's saved, and `/density` with no argument
+opens a chooser.
+
+| Density | What you see |
+|---|---|
+| `detailed` | Every tool call expanded |
+| `balanced` | Each tool call folded to one line. This is the default |
+| `diff` | Like the compact layout, but edits stay out of the groups so their diffs show |
+| `grouped` | The compact layout (`Ctrl+G`) |
+
+### Todo and tasks panes
+
+- The **todo pane** pins Claude's todo list above the prompt while it has open items. You see
+  the item in progress and its neighbours, plus a done count. `Alt+P` hides it.
+- The **tasks pane** (`Ctrl+B`, off by default) lists what's in flight: running tool calls and
+  subagents, `!` commands, `/btw` questions, queued prompts, and the last few commands Claude
+  started in the background. Claude Code doesn't tell clients when a background command ends, so
+  those show when they started, not whether they're still running.
+
+### Notifications
+
+When Claude needs a permission or an answer, blush rings the terminal bell. When a turn finishes
+or Claude needs you while the terminal is in the background, you also get a desktop notification:
+a toast on Windows, Notification Center on macOS, `notify-send` on Linux. blush knows the terminal
+is in the background from focus reports. If your terminal doesn't send them, you get a bell after
+turns longer than 20 seconds instead. Turn all of it off with `features.notify = false` or in
+settings (`F2`).
+
 ### `/after`
 
 `/after <task>` queues a task to run when the current turn finishes, without interrupting it.
@@ -322,6 +415,11 @@ show_thinking = true
 expand_thinking = false
 animations = true
 compact = false          # group tool calls & thinking between replies (Ctrl+G)
+timestamps_minimal = false  # timestamps on prompts only (/timestamps minimal)
+expand_tools = false     # new tool calls start expanded (/density detailed)
+diff_focus = false       # edits stay out of compact groups (/density diff)
+todo_pane = true         # pin Claude's todo list while it has open items (Alt+P)
+tasks_pane = false       # running and queued work above the prompt (Ctrl+B)
 
 [agent]
 default_mode = "bypassPermissions"   # default | acceptEdits | plan | auto | bypassPermissions
@@ -339,6 +437,7 @@ narrator = false      # spoken turn summaries (toggle with /narrator)
 sub_meter = true      # 5-hour / weekly subscription meter
 token_meter = true    # per-turn and session token counts
 timeline = true       # Time Machine snapshots after each turn
+notify = true         # bell + desktop notification when Claude finishes or needs you
 
 [update]
 auto = true                  # check GitHub on launch and self-update
@@ -355,6 +454,7 @@ branch = "main"
 |---|---|
 | `~/.blush/config.toml` | Settings |
 | `~/.blush/history` | Prompt history |
+| `~/.blush/titles.json` | Session names set with `/rename` |
 | `~/.blush/logs/agent.log` | The adapter's stderr, which is the first place to look when something goes wrong |
 | `~/.blush/adapter/` | The npm install of the ACP adapter that blush manages |
 | `~/.blush/src/` | The source checkout that self-updates build from |
@@ -389,6 +489,8 @@ default mode instead.
 | [`src/timeline.rs`](src/timeline.rs) | The Time Machine: snapshots in a private git index, and restores that only touch the paths that changed. |
 | [`src/usage.rs`](src/usage.rs) | Parses `/usage` into the subscription meter, and reads per-turn token usage from prompt responses. |
 | [`src/narrator.rs`](src/narrator.rs), [`src/peek.rs`](src/peek.rs) | Text-to-speech summaries, and opening or revealing files. |
+| [`src/app/extras.rs`](src/app/extras.rs) | The command palette, find, stash, send-now, queue editing, shell mode, `/btw`, `/rename`, density, the panes, settings, and notifications. |
+| [`src/attach.rs`](src/attach.rs), [`src/shell.rs`](src/shell.rs), [`src/notify.rs`](src/notify.rs) | Image and long-paste attachments, running `!` commands, and the bell and desktop notifications. |
 | [`src/update.rs`](src/update.rs), [`build.rs`](build.rs) | The self-updater: compares the build's git commit with GitHub, rebuilds from source, swaps the binary, and plays the update animation. |
 
 ## Troubleshooting

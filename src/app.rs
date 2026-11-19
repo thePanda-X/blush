@@ -11,7 +11,12 @@ use ratatui::layout::Rect;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
+mod extras;
+
+pub use extras::{Btw, Search, ShellRun};
+
 use crate::acp::{self, AcpClient, Incoming, RpcError};
+use crate::attach::{Attached, Attachments};
 use crate::config::{Config, home_dir};
 use crate::files::{FileIndex, fuzzy_filter, mentioned_paths};
 use crate::input::Input;
@@ -44,21 +49,36 @@ pub enum AppMsg {
     UsageDone(Result<Value, RpcError>),
     /// A Time Machine snapshot or jump finished: (toast/notice, is_error).
     Timeline(Option<(String, bool)>),
+    /// A `!` shell command finished: (its run id, result).
+    ShellDone(u64, std::io::Result<crate::shell::ShellResult>),
+    /// The fork a `/btw` question runs in was created: (run id, fork session id).
+    BtwStarted(u64, String),
+    /// A `/btw` question finished: (run id, result).
+    BtwDone(u64, Result<Value, RpcError>),
+    /// `session/set_title` replied.
+    TitleSet(Result<Value, RpcError>),
 }
 
 /// A prompt on its way to the agent, with its per-turn overrides.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Outgoing {
     pub text: String,
     /// `_` prefix: run this turn on Haiku.
     pub haiku: bool,
     /// `+` prefix: run this turn at max effort.
     pub max_effort: bool,
+    /// What the user typed (placeholders and prefixes included), so a queued
+    /// prompt can be pulled back into the editor.
+    pub raw: String,
+    /// Notes sent ahead of the prompt (shell output from `!` commands).
+    pub context: Vec<String>,
+    /// Images attached with `[Image #n]` placeholders.
+    pub images: Vec<Attached>,
 }
 
 impl Outgoing {
     pub fn plain(text: String) -> Outgoing {
-        Outgoing { text, haiku: false, max_effort: false }
+        Outgoing { raw: text.clone(), text, ..Outgoing::default() }
     }
 
     /// Parse leading `_` (Haiku) and `+` (max effort) markers.
@@ -81,6 +101,7 @@ impl Outgoing {
             return Outgoing::plain(raw.to_string());
         }
         out.text = rest.to_string();
+        out.raw = raw.to_string();
         out
     }
 
@@ -125,6 +146,8 @@ pub enum PickerKind {
     Option(String),
     Commit,
     Timeline,
+    /// The command palette (Ctrl+X): every command, searchable.
+    Palette,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +179,8 @@ pub enum Overlay {
     Picker(Picker),
     Shortcuts,
     Viewer { title: String, text: String, scroll: usize },
+    /// Settings (F2): toggles saved to config.toml.
+    Settings { sel: usize },
 }
 
 pub struct PermissionCard {
@@ -221,6 +246,8 @@ pub struct LayoutInfo {
     pub viewer_page: usize,
     /// Shortcuts overlay: the largest useful scroll offset.
     pub shortcuts_max: usize,
+    /// Settings overlay: (screen row, item index) of each row, for clicks.
+    pub settings_rows: Vec<(u16, usize)>,
 }
 
 pub enum External {
@@ -307,6 +334,31 @@ pub struct App {
     /// `session/update`s that arrived for a not-yet-known session while a
     /// `session/new` was in flight; replayed once its id is known.
     pub early_updates: Vec<(String, Value)>,
+
+    /// Whether the terminal has focus; None until it first reports.
+    pub focused: Option<bool>,
+    /// Images and collapsed pastes in the prompt being edited.
+    pub attachments: Attachments,
+    /// A prompt set aside with Ctrl+S (and its attachments).
+    pub stash: Option<(String, Vec<Attached>)>,
+    /// Prompts Ctrl+Enter put at the front of the queue while stopping the
+    /// turn; when non-zero, the stop doesn't hold the queue.
+    pub send_now: usize,
+    /// The `!` command running now.
+    pub shell: Option<ShellRun>,
+    /// Shell output waiting to go to Claude with the next prompt.
+    pub pending_context: Vec<String>,
+    /// `/btw` questions in flight.
+    pub btw: Vec<Btw>,
+    /// Counter for run ids (shell commands, side questions).
+    pub run_seq: u64,
+    /// Find in scrollback (Ctrl+F or / in the scrollback).
+    pub search: Option<Search>,
+    /// A title set with /rename (wins over the agent's automatic one).
+    pub title_override: Option<String>,
+    /// When the last keystroke burst was taken as a paste (its tail may
+    /// arrive in the next batch).
+    pub last_burst: Option<Instant>,
 }
 
 pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
@@ -329,15 +381,25 @@ pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("undo", "Restore files to the previous snapshot"),
     ("redo", "Restore files to the next snapshot"),
     ("after", "Queue a task to run when Claude finishes"),
+    ("btw", "Ask a side question without interrupting (answered in a fork)"),
+    ("queue", "List queued prompts (↑ on an empty prompt edits the last one)"),
+    ("tasks", "List running tools, background commands and queued prompts"),
+    ("find", "Search the scrollback"),
+    ("rename", "Rename this session"),
+    ("stash", "Set the prompt aside, or bring it back"),
+    ("density", "Tool-call detail: detailed · balanced · diff · grouped"),
+    ("todos", "Show / hide the pinned todo pane"),
+    ("tasks-pane", "Show / hide the tasks pane"),
+    ("settings", "Open settings"),
     ("narrator", "Read a summary of each turn aloud"),
     ("compact-mode", "Group tool calls and thinking between responses"),
     ("context", "Show context window usage"),
     ("session-info", "Show session details"),
     ("thinking", "Show / hide thinking blocks"),
-    ("timestamps", "Show / hide timestamps"),
+    ("timestamps", "Timestamps: on · minimal · off"),
     ("restart", "Restart the Claude Code agent"),
     ("login", "Sign in to Claude Code (claude auth login)"),
-    ("config", "Show the config file location"),
+    ("config", "Open settings (and show the config file)"),
     ("shortcuts", "Keyboard shortcuts"),
     ("help", "Keyboard shortcuts and commands"),
     ("quit", "Exit"),
@@ -349,6 +411,8 @@ impl App {
         let mut transcript = Transcript::new();
         transcript.show_thinking = config.ui.show_thinking;
         transcript.expand_thinking = config.ui.expand_thinking;
+        transcript.expand_tools = config.ui.expand_tools;
+        transcript.diff_focus = config.ui.diff_focus;
         transcript.push(Block::Welcome);
         if let Some(w) = &config.load_warning {
             transcript.notice(Level::Warn, w.clone());
@@ -415,6 +479,17 @@ impl App {
             starting: false,
             pending_prompt: None,
             early_updates: Vec::new(),
+            focused: None,
+            attachments: Attachments::default(),
+            stash: None,
+            send_now: 0,
+            shell: None,
+            pending_context: Vec::new(),
+            btw: Vec::new(),
+            run_seq: 0,
+            search: None,
+            title_override: None,
+            last_burst: None,
             config,
         }
     }
@@ -434,6 +509,8 @@ impl App {
     pub fn animating(&self) -> bool {
         self.responding
             || self.timeline_busy
+            || self.shell.is_some()
+            || !self.btw.is_empty()
             || matches!(self.conn, Conn::Starting(_))
             || self.transcript.entries.iter().rev().take(30).any(|e| e.is_live())
     }
@@ -517,6 +594,8 @@ impl App {
         self.question = None;
         let id = self.session.id.clone();
         self.session = Session::default();
+        // Re-applied from titles.json if the session is reopened.
+        self.title_override = None;
         self.startup = Some(match id {
             Some(id) if self.can_load() || self.can_resume() => {
                 if self.can_resume() { SessionKind::Resume(id) } else { SessionKind::Load(id) }
@@ -711,6 +790,9 @@ impl App {
                         self.transcript.notice(Level::Info, "Session resumed");
                     }
                 }
+                if let Some(t) = self.session.id.as_deref().and_then(extras::local_title) {
+                    self.title_override = Some(t);
+                }
                 self.update_title();
                 self.follow = true;
                 if (self.continue_latest || self.pick_session) && matches!(kind, SessionKind::New) && self.can_list() {
@@ -811,6 +893,18 @@ impl App {
                     None => {}
                 }
                 self.after_turn_housekeeping();
+            }
+            AppMsg::ShellDone(id, r) => self.on_shell_done(id, r),
+            AppMsg::BtwStarted(id, sid) => {
+                if let Some(b) = self.btw.iter_mut().find(|b| b.id == id) {
+                    b.sid = Some(sid);
+                }
+            }
+            AppMsg::BtwDone(id, r) => self.on_btw_done(id, r),
+            AppMsg::TitleSet(r) => {
+                if let Err(e) = r {
+                    self.toast(format!("Renamed here only (the agent didn't save it: {})", e.message));
+                }
             }
             AppMsg::Acp(inc) => self.on_incoming(inc).await,
         }
@@ -951,11 +1045,13 @@ impl App {
                 }
             }
         }
-        if !self.terminal_focused_hint() {
-            ring_bell();
+        if !cancelled {
+            let took = self.last_turn.map(|(d, _)| d).unwrap_or_default();
+            self.on_turn_finished_notify(took);
         }
         self.turns_done += 1;
-        if cancelled && !self.queue.is_empty() {
+        let send_now = std::mem::take(&mut self.send_now) > 0;
+        if cancelled && !self.queue.is_empty() && !send_now {
             self.queue_paused = true;
             let n = self.queue.len();
             self.toast(format!(
@@ -1145,12 +1241,8 @@ impl App {
              - {step}\n\
              - Finish with one line per commit: short hash and subject."
         );
-        let out = Outgoing { text, haiku: true, max_effort: false };
+        let out = Outgoing { text, haiku: true, raw: format!("/commit {how}"), ..Outgoing::default() };
         self.enqueue(format!("/commit · {label}"), out);
-    }
-
-    fn terminal_focused_hint(&self) -> bool {
-        true
     }
 
     fn apply_session_update(&mut self, u: &Value) {
@@ -1171,6 +1263,10 @@ impl App {
                     let update_sid = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                     if !update_sid.is_empty() && Some(update_sid) != self.session.id.as_deref() {
                         let Some(u) = params.get("update") else { return };
+                        if self.btw.iter().any(|b| b.sid.as_deref() == Some(update_sid)) {
+                            self.on_btw_update(update_sid.to_string(), u);
+                            return;
+                        }
                         match self.usage_probe.as_mut() {
                             Some((probe, buf)) if probe == update_sid => {
                                 if s(u, "sessionUpdate") == "agent_message_chunk" {
@@ -1230,6 +1326,28 @@ impl App {
 
     fn on_request(&mut self, id: Value, method: &str, params: Value) {
         let Some(client) = self.client.clone() else { return };
+        // Background sessions (a /btw fork, the /usage probe) never get to
+        // change anything: refuse what they ask permission for.
+        let req_sid = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+        let background = self.btw.iter().any(|b| b.sid.as_deref() == Some(req_sid))
+            || self.usage_probe.as_ref().is_some_and(|(p, _)| p == req_sid);
+        let foreign = !req_sid.is_empty() && (background || self.session.id.as_deref().is_some_and(|me| me != req_sid));
+        if foreign && matches!(method, "session/request_permission" | "elicitation/create") {
+            if method == "elicitation/create" {
+                client.respond(id, json!({"action": "decline"}));
+                return;
+            }
+            let reject = params
+                .get("options")
+                .and_then(|o| o.as_array())
+                .and_then(|a| a.iter().find(|o| s(o, "kind") == "reject_once").map(|o| s(o, "optionId")));
+            let outcome = match reject {
+                Some(oid) => json!({"outcome": {"outcome": "selected", "optionId": oid}}),
+                None => json!({"outcome": {"outcome": "cancelled"}}),
+            };
+            client.respond(id, outcome);
+            return;
+        }
         match method {
             "session/request_permission" => {
                 let tc = params.get("toolCall").cloned().unwrap_or(Value::Null);
@@ -1268,8 +1386,9 @@ impl App {
                 if title.is_empty() {
                     title = "Permission requested".into();
                 }
+                let what = title.clone();
                 self.permissions.push_back(PermissionCard { id, title, detail, options, sel: 0, shown: Instant::now() });
-                ring_bell();
+                self.attention("Claude needs permission", &what);
             }
             "elicitation/create" => {
                 if let Some(card) = build_question(id.clone(), &params) {
@@ -1278,8 +1397,9 @@ impl App {
                     if self.question.is_some() {
                         self.answer_question("cancel");
                     }
+                    let what = card.message.clone();
                     self.question = Some(card);
-                    ring_bell();
+                    self.attention("Claude has a question", &what);
                 } else {
                     client.respond(id, json!({"action": "cancel"}));
                 }
@@ -1350,6 +1470,9 @@ impl App {
     }
 
     fn update_title(&mut self) {
+        if let Some(t) = &self.title_override {
+            self.session.title = Some(t.clone());
+        }
         let t = match &self.session.title {
             Some(t) => format!("{t} - blush"),
             None => "blush".to_string(),
@@ -1367,6 +1490,9 @@ impl App {
 
     pub async fn submit(&mut self, raw: String) {
         let text = raw.trim_end().to_string();
+        if text.trim().is_empty() && !self.attachments.items.is_empty() {
+            self.attachments.clear();
+        }
         if text.trim().is_empty() {
             if self.queue_paused {
                 self.queue_paused = false;
@@ -1375,6 +1501,11 @@ impl App {
             return;
         }
         save_history_line(&text);
+        if let Some(cmd) = text.strip_prefix('!') {
+            self.attachments.clear();
+            self.run_shell(cmd.trim().to_string());
+            return;
+        }
         if let Some(rest) = text.strip_prefix('/') {
             let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             if LOCAL_COMMANDS.iter().any(|(n, _)| *n == name) || matches!(name, "exit" | "q" | "yolo" | "bypass" | "keys" | "t") {
@@ -1382,8 +1513,20 @@ impl App {
                 return;
             }
         }
-        let out = Outgoing::parse(&text);
+        let out = self.outgoing_from(&text);
         self.enqueue(out.text.clone(), out);
+    }
+
+    /// Build the prompt for `text`: expand pasted-text placeholders, attach
+    /// images it mentions, and pick up pending shell output.
+    fn outgoing_from(&mut self, text: &str) -> Outgoing {
+        let (expanded, images) = self.attachments.take(text);
+        // `raw` keeps image placeholders but has pasted text expanded, so a
+        // queued prompt pulled back for editing loses nothing.
+        let mut out = Outgoing::parse(&expanded);
+        out.images = images;
+        out.context = std::mem::take(&mut self.pending_context);
+        out
     }
 
     /// Show `display` as the user's prompt and send `out` now, or queue it
@@ -1521,7 +1664,7 @@ impl App {
         let overrides = self.turn_overrides(&out);
         self.turn_tag = out.tag();
         self.turn_prompt = out.text.clone();
-        let text = out.text;
+        let text = out.text.clone();
         self.narrator.stop();
         self.transcript.begin_turn();
         self.responding = true;
@@ -1531,7 +1674,12 @@ impl App {
         self.follow = true;
         self.scroll = 0;
         self.selected = None;
-        let mut blocks = vec![acp::text_block(&text)];
+        let mut blocks: Vec<Value> = out.context.iter().map(|c| acp::text_block(c)).collect();
+        blocks.push(acp::text_block(&text));
+        blocks.extend(out.images.iter().filter_map(|a| match &a.item {
+            crate::attach::Attachment::Image(v) => Some(v.clone()),
+            crate::attach::Attachment::Text(_) => None,
+        }));
         for p in mentioned_paths(&text, &self.cwd) {
             if p.is_file() {
                 blocks.push(acp::resource_link(&p));
@@ -1584,9 +1732,16 @@ impl App {
     fn reset_transcript(&mut self) {
         let show = self.transcript.show_thinking;
         let expand = self.transcript.expand_thinking;
+        let (tools, diff) = (self.transcript.expand_tools, self.transcript.diff_focus);
         self.transcript = Transcript::new();
         self.transcript.show_thinking = show;
         self.transcript.expand_thinking = expand;
+        self.transcript.expand_tools = tools;
+        self.transcript.diff_focus = diff;
+        self.search = None;
+        self.title_override = None;
+        // Shell output belongs to the session it was run in.
+        self.pending_context.clear();
         self.selected = None;
         self.scroll = 0;
         self.follow = true;
@@ -1697,27 +1852,24 @@ impl App {
                     self.apply_theme(args, true);
                     return;
                 }
-                let items = THEME_NAMES
-                    .iter()
-                    .map(|(n, d)| PickItem {
-                        label: n.to_string(),
-                        detail: d.to_string(),
-                        value: n.to_string(),
-                        current: *n == self.theme.name,
-                    })
-                    .collect();
-                self.open_picker(PickerKind::Theme, "Theme", items);
-                if let Overlay::Picker(p) = &mut self.overlay {
-                    p.original_theme = Some(self.config.ui.theme.clone());
-                }
+                self.open_theme_picker();
             }
             "copy" => {
-                let last = self.transcript.entries.iter().rev().find_map(|e| match &e.block {
-                    Block::Agent { text } => Some(text.clone()),
-                    _ => None,
-                });
-                match last {
+                // `/copy 2` copies the second-latest response.
+                let n = args.parse::<usize>().unwrap_or(1).max(1);
+                let nth = self
+                    .transcript
+                    .entries
+                    .iter()
+                    .rev()
+                    .filter_map(|e| match &e.block {
+                        Block::Agent { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .nth(n - 1);
+                match nth {
                     Some(t) => self.copy(&t),
+                    None if n > 1 => self.toast(format!("There aren't {n} responses yet")),
                     None => self.toast("Nothing to copy yet"),
                 }
             }
@@ -1733,7 +1885,7 @@ impl App {
                 if args.is_empty() {
                     self.toast("Usage: /after <task> — runs once Claude finishes");
                 } else {
-                    let out = Outgoing::parse(args);
+                    let out = self.outgoing_from(args);
                     self.enqueue(out.text.clone(), out);
                 }
             }
@@ -1774,13 +1926,7 @@ impl App {
                 Config::persist(|c| c.ui.show_thinking = on);
                 self.toast(if self.transcript.show_thinking { "Thinking shown" } else { "Thinking hidden" });
             }
-            "timestamps" => {
-                self.config.ui.show_timestamps = !self.config.ui.show_timestamps;
-                let on = self.config.ui.show_timestamps;
-                Config::persist(|c| c.ui.show_timestamps = on);
-                self.invalidate_all();
-                self.toast(if on { "Timestamps shown" } else { "Timestamps hidden" });
-            }
+            "timestamps" => self.set_timestamps(args),
             "restart" => {
                 self.transcript.notice(Level::Info, "Restarting Claude Code…");
                 self.restart_agent().await;
@@ -1788,15 +1934,13 @@ impl App {
             "login" => {
                 self.external = Some(External::Login);
             }
-            "config" => {
-                self.transcript.notice(Level::Info, format!("Config file: {}", crate::config::config_path().display()));
-            }
+            "config" | "settings" => self.open_settings(),
             "shortcuts" | "help" | "keys" => {
                 self.shortcuts_scroll = 0;
                 self.overlay = Overlay::Shortcuts;
             }
             "quit" | "exit" | "q" => self.should_quit = true,
-            _ => {}
+            other => self.run_extra_command(other, args).await,
         }
     }
 
@@ -1820,6 +1964,17 @@ impl App {
             self.transcript.push(Block::Welcome);
         }
         self.open_session(kind);
+    }
+
+    fn open_theme_picker(&mut self) {
+        let items = THEME_NAMES
+            .iter()
+            .map(|(n, d)| PickItem { label: n.to_string(), detail: d.to_string(), value: n.to_string(), current: *n == self.theme.name })
+            .collect();
+        self.open_picker(PickerKind::Theme, "Theme", items);
+        if let Overlay::Picker(p) = &mut self.overlay {
+            p.original_theme = Some(self.config.ui.theme.clone());
+        }
     }
 
     fn open_option_picker(&mut self, id: &str, kind: PickerKind) {
@@ -1863,7 +2018,7 @@ impl App {
         let items = sessions
             .iter()
             .map(|sess| {
-                let title = s(sess, "title");
+                let title = extras::local_title(&s(sess, "sessionId")).unwrap_or_else(|| s(sess, "title"));
                 let updated = s(sess, "updatedAt");
                 let when = chrono::DateTime::parse_from_rfc3339(&updated)
                     .map(|d| relative_time(d.with_timezone(&chrono::Local)))
@@ -1897,7 +2052,7 @@ impl App {
         self.invalidate_all();
     }
 
-    fn picker_choose(&mut self) {
+    async fn picker_choose(&mut self) {
         let Overlay::Picker(p) = std::mem::replace(&mut self.overlay, Overlay::None) else { return };
         let vis = p.visible();
         let Some(item) = vis.get(p.sel).and_then(|i| p.items.get(*i)).cloned() else {
@@ -1926,6 +2081,7 @@ impl App {
                     self.timeline_jump(i);
                 }
             }
+            PickerKind::Palette => Box::pin(self.palette_run(item.value)).await,
         }
     }
 
@@ -1980,6 +2136,7 @@ impl App {
                 Block::Tool(t) => md.push_str(&format!("> **{}** `{}`\n\n", t.kind, t.title.replace('`', ""))),
                 Block::Plan(_) => md.push_str(&format!("```\n{}\n```\n\n", e.plain_text())),
                 Block::Notice { text, .. } => md.push_str(&format!("> {text}\n\n")),
+                Block::Aside { question, answer, .. } => md.push_str(&format!("> **btw** {question}\n>\n> {}\n\n", answer.replace('\n', "\n> "))),
                 _ => {}
             }
         }
@@ -2061,7 +2218,7 @@ impl App {
                     let takes_args = matches!(name.as_str(), "export" | "resume" | "theme" | "model" | "effort" | "mode" | "plan")
                         && !local;
                     self.input.set(&format!("/{name}"));
-                    if *local && name == "after" {
+                    if *local && matches!(name.as_str(), "after" | "btw" | "rename") {
                         // Needs a task to be useful: leave room to type it.
                         self.input.insert_char(' ');
                         return false;
@@ -2103,11 +2260,21 @@ impl App {
                     q.text.push_str(&s);
                     return;
                 }
+                if let Some(search) = self.search.as_mut() {
+                    search.query.push_str(s.lines().next().unwrap_or(""));
+                    self.search_refresh(true);
+                    return;
+                }
+                if !matches!(self.overlay, Overlay::None) {
+                    return;
+                }
                 self.focus = Focus::Prompt;
-                self.input.insert_str(&s);
+                self.on_paste(s);
                 self.refresh_completion();
             }
             Event::Mouse(m) => self.on_mouse(m).await,
+            Event::FocusGained => self.focused = Some(true),
+            Event::FocusLost => self.focused = Some(false),
             _ => {}
         }
     }
@@ -2150,6 +2317,13 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if matches!(self.overlay, Overlay::Settings { .. }) {
+                    if let Some(&(_, i)) = self.layout.settings_rows.iter().find(|(y, _)| *y == m.row) {
+                        self.overlay = Overlay::Settings { sel: i };
+                        self.settings_activate(i, 1);
+                    }
+                    return;
+                }
                 if !matches!(self.overlay, Overlay::None) {
                     return;
                 }
@@ -2337,14 +2511,23 @@ impl App {
                 self.completion = None;
                 return;
             }
+            if self.search.is_some() {
+                self.search = None;
+                return;
+            }
             // Once a stop has been requested, further presses fall through so
             // a stuck agent can't keep you from clearing the prompt or quitting.
             if self.responding && !self.cancelling {
                 self.cancel_turn();
                 return;
             }
+            if self.shell.is_some() {
+                self.kill_shell();
+                return;
+            }
             if !self.input.is_empty() {
                 self.input.clear();
+                self.attachments.clear();
                 self.completion = None;
                 return;
             }
@@ -2385,6 +2568,21 @@ impl App {
         }
 
         // Overlays
+        if let Overlay::Settings { sel } = self.overlay {
+            let n = self.settings_items().len().max(1);
+            let cur = sel.min(n - 1);
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(2) => self.overlay = Overlay::None,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    self.overlay = Overlay::Settings { sel: if cur == 0 { n - 1 } else { cur - 1 } }
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.overlay = Overlay::Settings { sel: (cur + 1) % n },
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => self.settings_activate(cur, 1),
+                KeyCode::Left | KeyCode::Char('h') => self.settings_activate(cur, -1),
+                _ => {}
+            }
+            return;
+        }
         match &mut self.overlay {
             Overlay::Shortcuts => {
                 let max = self.layout.shortcuts_max;
@@ -2424,7 +2622,7 @@ impl App {
             Overlay::Picker(p) => {
                 match k.code {
                     KeyCode::Esc => self.picker_cancel(),
-                    KeyCode::Enter => self.picker_choose(),
+                    KeyCode::Enter => Box::pin(self.picker_choose()).await,
                     KeyCode::Right if p.kind == PickerKind::Timeline => {
                         let vis = p.visible();
                         if let Some(i) = vis.get(p.sel).and_then(|i| p.items.get(*i)).and_then(|it| it.value.parse().ok()) {
@@ -2456,7 +2654,7 @@ impl App {
                 }
                 return;
             }
-            Overlay::None => {}
+            Overlay::Settings { .. } | Overlay::None => {}
         }
 
         // Blocking cards
@@ -2501,6 +2699,13 @@ impl App {
         }
         if self.question.is_some() {
             self.on_question_key(k);
+            return;
+        }
+        if self.search.is_some() {
+            self.on_search_key(k, ctrl, shift);
+            return;
+        }
+        if self.on_extra_global_key(&k, ctrl, alt).await {
             return;
         }
 
@@ -2617,6 +2822,26 @@ impl App {
     }
 
     async fn on_scrollback_key(&mut self, k: KeyEvent, ctrl: bool, shift: bool) {
+        match k.code {
+            KeyCode::Char('u') | KeyCode::Char('d') if ctrl => {
+                let half = (self.layout.view_height / 2).max(1) as isize;
+                self.scroll_by(if k.code == KeyCode::Char('u') { half } else { -half });
+                return;
+            }
+            KeyCode::Char('/') => {
+                self.open_search();
+                return;
+            }
+            KeyCode::Char('?') => {
+                self.open_palette();
+                return;
+            }
+            KeyCode::Char('m') => {
+                self.toggle_raw();
+                return;
+            }
+            _ => {}
+        }
         match k.code {
             KeyCode::Esc | KeyCode::Tab | KeyCode::Char(' ') | KeyCode::Char('i') => {
                 self.focus = Focus::Prompt;
@@ -2751,6 +2976,7 @@ impl App {
                 Block::Thought { .. } => "Thinking".to_string(),
                 Block::Tool(t) => t.title.clone(),
                 Block::Plan(_) => "Plan".to_string(),
+                Block::Aside { .. } => "Side question".to_string(),
                 _ => "Entry".to_string(),
             };
             let text = e.plain_text();
@@ -2804,6 +3030,9 @@ impl App {
         }
 
         match k.code {
+            KeyCode::Enter if ctrl && !shift && !alt && self.responding && !self.input.text.trim().is_empty() => {
+                self.send_now().await;
+            }
             KeyCode::Enter => {
                 let newline = shift || alt || ctrl;
                 if newline {
@@ -2832,10 +3061,20 @@ impl App {
                 } else if !self.input.is_empty() {
                     if self.esc_armed.is_some_and(|t| t.elapsed() < Duration::from_millis(800)) {
                         self.input.clear();
+                        self.attachments.clear();
                         self.esc_armed = None;
                     } else {
                         self.esc_armed = Some(Instant::now());
                         self.toast("Esc again to clear");
+                    }
+                } else if self.has_snapshots() {
+                    // Esc Esc on an empty prompt: rewind files with the Time Machine.
+                    if self.esc_armed.is_some_and(|t| t.elapsed() < Duration::from_millis(800)) {
+                        self.esc_armed = None;
+                        self.open_timeline();
+                    } else {
+                        self.esc_armed = Some(Instant::now());
+                        self.toast("Esc again to rewind files (Time Machine)");
                     }
                 }
             }
@@ -2856,6 +3095,9 @@ impl App {
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
+            KeyCode::Up if self.input.is_empty() && !self.input.in_history() && !self.queue.is_empty() => {
+                self.edit_last_queued();
+            }
             KeyCode::Up => {
                 if self.input.in_history() || !self.input.up(width) {
                     if !self.input.history_prev() && self.input.is_empty() {
@@ -3041,12 +3283,6 @@ fn relative_time(t: chrono::DateTime<chrono::Local>) -> String {
     } else {
         t.format("%b %d").to_string()
     }
-}
-
-fn ring_bell() {
-    // Leave a hint in terminals that surface BEL as an attention request.
-    let _ = std::io::stdout().write_all(b"\x07");
-    let _ = std::io::stdout().flush();
 }
 
 fn history_path() -> PathBuf {

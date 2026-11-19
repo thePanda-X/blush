@@ -53,11 +53,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         want.min(room.saturating_sub(4).max(want.min(8))).min(room)
     };
     let fixed = header_h + gap + status_h + card_h + prompt_h + footer_h;
-    let scroll_h = area.height.saturating_sub(fixed);
+    // Pinned panes (todos, tasks) sit above the status row, but never take
+    // the scrollback below a handful of rows.
+    let pane_lines = pane_lines(app, &th, area.width.saturating_sub(4) as usize);
+    let pane_h = (pane_lines.len() as u16).min(area.height.saturating_sub(fixed).saturating_sub(6)).min(10);
+    let scroll_h = area.height.saturating_sub(fixed + pane_h);
 
     let header = Rect { x: area.x, y: area.y, width: area.width, height: header_h };
     let scroll = Rect { x: area.x, y: header.y + header_h + gap, width: area.width, height: scroll_h };
-    let status = Rect { x: area.x, y: scroll.y + scroll_h, width: area.width, height: status_h };
+    let pane = Rect { x: area.x, y: scroll.y + scroll_h, width: area.width, height: pane_h };
+    let status = Rect { x: area.x, y: pane.y + pane_h, width: area.width, height: status_h };
     let card = Rect { x: area.x, y: status.y + status_h, width: area.width, height: card_h };
     let prompt = Rect { x: area.x, y: card.y + card_h, width: area.width, height: prompt_h };
     let footer = Rect { x: area.x, y: prompt.y + prompt_h, width: area.width, height: footer_h };
@@ -71,6 +76,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_header(f, app, &th, header);
     draw_scrollback(f, app, &th, scroll, &mut layout);
+    if pane_h > 0 {
+        let lines: Vec<Line> = pane_lines.into_iter().take(pane_h as usize).collect();
+        f.render_widget(Paragraph::new(lines), Rect { x: pane.x + 2, width: pane.width.saturating_sub(3), ..pane });
+    }
     draw_status(f, app, &th, status, &mut layout);
     if card_h > 0 {
         draw_card(f, app, &th, card, card_lines);
@@ -85,6 +94,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Picker(_) => draw_picker(f, app, &th, full),
         Overlay::Shortcuts => draw_shortcuts(f, app, &th, full, &mut layout),
         Overlay::Viewer { .. } => draw_viewer(f, app, &th, full, &mut layout),
+        Overlay::Settings { .. } => draw_settings(f, app, &th, full, &mut layout),
     }
     app.layout = layout;
 }
@@ -131,7 +141,7 @@ pub fn display_path(p: &std::path::Path) -> String {
 
 // ---------------------------------------------------------------- scrollback
 
-fn entry_lines(entry: &Entry, width: u16, th: &Theme, tick: u64, show_ts: bool) -> (Rc<Vec<Line<'static>>>, bool, usize) {
+fn entry_lines(entry: &Entry, width: u16, th: &Theme, tick: u64, show_ts: bool, ts_minimal: bool) -> (Rc<Vec<Line<'static>>>, bool, usize) {
     let live = entry.is_live();
     if !live {
         if let Some(c) = entry.cache.borrow().as_ref() {
@@ -147,7 +157,7 @@ fn entry_lines(entry: &Entry, width: u16, th: &Theme, tick: u64, show_ts: bool) 
         let ts = entry.time.format("%-I:%M %p").to_string();
         let row = match entry.block {
             Block::User { .. } => Some(1),
-            Block::Agent { .. } => Some(0),
+            Block::Agent { .. } if !ts_minimal => Some(0),
             _ => None,
         };
         if let Some(row) = row {
@@ -167,6 +177,80 @@ fn entry_lines(entry: &Entry, width: u16, th: &Theme, tick: u64, show_ts: bool) 
             Some(RenderCache { width, rev: entry.rev, fold: entry.fold, selected: false, lines: lines.clone() });
     }
     (lines, r.band, r.header_rows)
+}
+
+// ---------------------------------------------------------------- panes
+
+/// The todo pane (Claude's latest todo list while it has open items) and
+/// the tasks pane (running and queued work), stacked.
+fn pane_lines(app: &App, th: &Theme, w: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if app.config.ui.todo_pane {
+        if let Some(items) = app.transcript.latest_plan() {
+            let open = items.iter().any(|i| i.status != "completed");
+            if open || app.responding {
+                let done = items.iter().filter(|i| i.status == "completed").count();
+                out.push(Line::from(vec![
+                    Span::styled(format!("{DIAMOND} "), Style::default().fg(th.plan)),
+                    Span::styled("Todos", Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {done}/{}", items.len()), th.muted()),
+                    Span::styled("   Alt+P hides", th.dim()),
+                ]));
+                // A window of five around the item in progress.
+                let active = items
+                    .iter()
+                    .position(|i| i.status == "in_progress")
+                    .or_else(|| items.iter().position(|i| i.status != "completed"))
+                    .unwrap_or(items.len().saturating_sub(1));
+                let start = active.saturating_sub(1).min(items.len().saturating_sub(5));
+                for item in items.iter().skip(start).take(5) {
+                    let (glyph, gstyle, tstyle) = match item.status.as_str() {
+                        "completed" => ("✓ ", th.fg(th.success), Style::default().fg(th.gray).add_modifier(Modifier::CROSSED_OUT)),
+                        "in_progress" => ("◉ ", th.fg(th.accent), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+                        _ => ("○ ", th.fg(th.gray), th.secondary()),
+                    };
+                    out.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(glyph, gstyle),
+                        Span::styled(truncate(&sanitize(&item.content), w.saturating_sub(5)), tstyle),
+                    ]));
+                }
+            }
+        }
+    }
+    if app.config.ui.tasks_pane {
+        let rows = app.task_rows();
+        out.push(Line::from(vec![
+            Span::styled(format!("{DIAMOND} "), th.accent()),
+            Span::styled("Tasks", Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+            Span::styled(if rows.is_empty() { String::new() } else { format!("  {}", rows.len()) }, th.muted()),
+            Span::styled("   Ctrl+B hides", th.dim()),
+        ]));
+        if rows.is_empty() {
+            out.push(Line::from(Span::styled("  nothing running", th.dim())));
+        }
+        for r in rows.iter().take(5) {
+            let color = match r.kind {
+                "running" | "subagent" => th.accent,
+                "shell" => th.command,
+                "btw" => th.info,
+                "background" => th.success,
+                _ => th.gray,
+            };
+            let since = r.since.map(|d| format!("  {}", human_duration_short(d))).unwrap_or_default();
+            let room = w.saturating_sub(14 + crate::text::width(&since));
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<11}", r.kind), Style::default().fg(color)),
+                Span::styled(truncate(&sanitize(&r.label), room), th.secondary()),
+                Span::styled(since, th.dim()),
+            ]));
+        }
+        if rows.len() > 5 {
+            out.push(Line::from(Span::styled(format!("  +{} more · /tasks lists them all", rows.len() - 5), th.dim())));
+        }
+    }
+    out
 }
 
 fn meta_for(entry: &Entry) -> (bool, usize) {
@@ -196,6 +280,7 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
     }
     let content_w = r.width.saturating_sub(4); // rail(1) + pad(1) + ... + pad(1) + scrollbar(1)
     let show_ts = app.config.ui.show_timestamps;
+    let ts_minimal = app.config.ui.timestamps_minimal;
     let tick = app.tick;
 
     // Gather (entry index, gap_before, lines, band, header_rows, kind)
@@ -231,7 +316,7 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             }
             first_in_open_group = true;
         }
-        let (lines, band, hdr) = entry_lines(e, content_w, th, tick, show_ts);
+        let (lines, band, hdr) = entry_lines(e, content_w, th, tick, show_ts, ts_minimal);
         if lines.is_empty() {
             continue;
         }
@@ -481,6 +566,19 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     if !app.queue.is_empty() {
         left.push(Span::styled(format!("  · {} queued", app.queue.len()), th.muted()));
     }
+    if let Some(s) = &app.search {
+        let info = match (s.query.is_empty(), s.matches.len()) {
+            (true, _) => "type to search the scrollback".to_string(),
+            (false, 0) => "no matches".to_string(),
+            (false, n) => format!("{} of {n}", s.cur + 1),
+        };
+        left = vec![
+            Span::styled("Find ", Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(s.query.clone(), th.bold()),
+            Span::styled("▏", th.accent()),
+            Span::styled(format!("  {info}"), if s.matches.is_empty() && !s.query.is_empty() { Style::default().fg(th.warning) } else { th.muted() }),
+        ];
+    }
     if let Some((msg, at)) = &app.toast {
         if at.elapsed() < Duration::from_millis(2500) {
             if !left.is_empty() {
@@ -637,6 +735,20 @@ fn draw_prompt(f: &mut Frame, app: &App, th: &Theme, r: Rect, inner_w: usize) {
         _ => th.gray_bright,
     };
     let mut title = vec![Span::styled(" ", th.dim())];
+    let shell_mode = app.input.text.starts_with('!');
+    if shell_mode {
+        title.push(Span::styled(format!("! {} ", crate::shell::name()), Style::default().fg(th.command).add_modifier(Modifier::BOLD)));
+        title.push(Span::styled("· ", th.dim()));
+    }
+    if !app.pending_context.is_empty() {
+        let n = app.pending_context.len();
+        title.push(Span::styled(format!("+{n} shell output{} ", if n == 1 { "" } else { "s" }), th.accent()));
+        title.push(Span::styled("· ", th.dim()));
+    }
+    if app.stash.is_some() {
+        title.push(Span::styled("stashed ", th.muted()));
+        title.push(Span::styled("· ", th.dim()));
+    }
     if app.conn == Conn::Ready || app.session.id.is_some() {
         title.push(Span::styled(app.session.model_label(), Style::default().fg(th.gray_bright)));
         if !mode.is_empty() {
@@ -664,7 +776,7 @@ fn draw_prompt(f: &mut Frame, app: &App, th: &Theme, r: Rect, inner_w: usize) {
             Conn::Starting(_) => "Claude Code is starting — you can type now",
             Conn::Failed(_) | Conn::Exited => "Agent not running — /restart",
             Conn::Ready if app.responding => "Queue a follow-up…",
-            Conn::Ready => "Ask Claude anything  ·  / commands  ·  @ files",
+            Conn::Ready => "Ask Claude anything  ·  / commands  ·  @ files  ·  ! shell",
         };
         f.buffer_mut().set_string(text_x, inner.y, truncate(ph, inner_w), th.dim());
         if focused {
@@ -676,16 +788,30 @@ fn draw_prompt(f: &mut Frame, app: &App, th: &Theme, r: Rect, inner_w: usize) {
     let (cr, cc) = app.input.cursor_pos(inner_w.max(1));
     let visible = inner.height as usize;
     let first = if cr >= visible { cr + 1 - visible } else { 0 };
+    // Attachment placeholders ([Image #1], [Pasted text #2 +40 lines]).
+    let tokens: Vec<(usize, usize)> = app
+        .attachments
+        .items
+        .iter()
+        .flat_map(|a| app.input.text.match_indices(a.label.as_str()).map(|(i, m)| (i, i + m.len())).collect::<Vec<_>>())
+        .collect();
     let buf = f.buffer_mut();
     for (i, (s, e)) in rows.iter().enumerate().skip(first).take(visible) {
         let y = inner.y + (i - first) as u16;
         let seg = &app.input.text[*s..*e];
         let seg = seg.trim_end_matches('\n');
-        let style = Style::default().fg(th.text);
-        // Highlight @mentions and a leading /command.
+        let style = Style::default().fg(if shell_mode { th.command } else { th.text });
+        // Highlight @mentions, attachments and a leading /command or !command.
         let mut x = text_x;
+        let mut off = *s;
         for word in split_keep_ws(seg) {
-            let st = if word.starts_with('@') && word.len() > 1 {
+            let (ws, we) = (off, off + word.len());
+            off = we;
+            let st = if tokens.iter().any(|(a, b)| ws < *b && we > *a) && !word.trim().is_empty() {
+                Style::default().fg(th.accent).add_modifier(Modifier::ITALIC)
+            } else if shell_mode && i == 0 && x == text_x {
+                Style::default().fg(th.command).add_modifier(Modifier::BOLD)
+            } else if word.starts_with('@') && word.len() > 1 {
                 Style::default().fg(th.accent)
             } else if i == 0 && x == text_x && word.starts_with('/') {
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
@@ -734,7 +860,9 @@ fn hint_line(th: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut LayoutInfo) {
-    let hints: Vec<(&str, &str)> = if !app.permissions.is_empty() {
+    let hints: Vec<(&str, &str)> = if app.search.is_some() {
+        vec![("↑ / Enter", "older match"), ("↓", "newer match"), ("Esc", "close")]
+    } else if !app.permissions.is_empty() {
         vec![("↑↓", "select"), ("Enter", "confirm"), ("1-9", "pick"), ("Esc", "deny"), ("Ctrl+C", "stop turn")]
     } else if app.question.is_some() {
         vec![("↑↓", "select"), ("Space", "toggle"), ("Enter", "confirm"), ("Esc", "dismiss")]
@@ -743,13 +871,17 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     } else if app.focus == Focus::Scrollback && app.selected_path().is_some() {
         vec![("o", "open"), ("r", "reveal"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
     } else if app.focus == Focus::Scrollback {
-        vec![("↑↓", "select"), ("←→", "fold"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
+        vec![("↑↓", "select"), ("←→", "fold"), ("Enter", "view"), ("y", "copy"), ("/", "find"), ("m", "raw"), ("Tab", "prompt")]
+    } else if app.input.text.starts_with('!') {
+        vec![("Enter", "run in your shell"), ("Ctrl+C", "clear"), ("Ctrl+.", "shortcuts")]
     } else if app.queue_paused && app.input.is_empty() {
         vec![("Enter", "send queued"), ("Ctrl+C", "drop queued"), ("Ctrl+.", "shortcuts")]
     } else if app.responding {
-        vec![("Ctrl+C", "stop"), ("Enter", "queue"), ("Shift+Tab", "mode"), ("Ctrl+.", "shortcuts")]
+        vec![("Ctrl+C", "stop"), ("Enter", "queue"), ("Ctrl+Enter", "send now"), ("Shift+Tab", "mode"), ("Ctrl+.", "shortcuts")]
+    } else if app.shell.is_some() {
+        vec![("Ctrl+C", "stop the shell command"), ("Ctrl+B", "tasks"), ("Ctrl+.", "shortcuts")]
     } else {
-        vec![("Shift+Tab", "mode"), ("@", "files"), ("/", "commands"), ("Ctrl+.", "shortcuts")]
+        vec![("Shift+Tab", "mode"), ("@", "files"), ("/", "commands"), ("Ctrl+X", "palette"), ("Ctrl+.", "shortcuts")]
     };
     // Right side: subscription meter, then the narrator toggle.
     let mut right: Vec<Span> = Vec::new();
@@ -971,27 +1103,40 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
     let groups: &[(&str, &[(&str, &str)])] = &[
         ("Prompt", &[
             ("Enter", "send (queues while Claude is responding)"),
+            ("Ctrl+Enter", "send now: stop the turn, send this next"),
             ("Shift/Alt+Enter, Ctrl+J, \\⏎", "new line"),
             ("Shift+Tab", "cycle permission mode"),
             ("↑ / ↓", "history"),
+            ("↑ on an empty prompt", "edit the last queued prompt"),
             ("Tab", "focus the scrollback"),
             ("Ctrl+C", "stop response · clear · quit (×2)"),
-            ("Esc Esc", "clear the prompt"),
+            ("Esc Esc", "clear · rewind files when empty"),
+            ("Ctrl+S", "stash the prompt / bring it back"),
             ("/  @", "commands · mention files"),
+            ("! command", "run in your shell, output to Claude"),
+            ("Alt+V", "attach the clipboard's image"),
             ("_ prompt", "run this turn on Haiku"),
             ("+ prompt", "run this turn at max effort"),
         ]),
         ("Scrollback", &[
-            ("↑ / ↓", "select entry"),
+            ("↑ / ↓  ·  j / k", "select entry"),
             ("Shift+← / →", "previous / next turn"),
             ("← / →", "collapse / expand"),
             ("Enter", "open in viewer"),
             ("y / Y", "copy content / command"),
             ("o / r", "open / reveal the entry's file"),
+            ("m", "markdown source / rendered"),
+            ("/", "find in the scrollback"),
+            ("?", "command palette"),
             ("g / G", "top / bottom"),
+            ("Ctrl+U / Ctrl+D", "half page up / down"),
             ("PgUp / PgDn, wheel", "scroll"),
         ]),
         ("Global", &[
+            ("Ctrl+X", "command palette"),
+            ("Ctrl+F", "find in the scrollback"),
+            ("F2", "settings"),
+            ("Alt+P · Ctrl+B", "todo pane · tasks pane"),
             ("Ctrl+E", "expand / collapse thinking"),
             ("Ctrl+O", "expand / collapse all blocks"),
             ("Ctrl+G", "compact layout: group tools & thinking"),
@@ -1014,6 +1159,9 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
             ("/commit", "Conventional Commits on Haiku"),
             ("/timeline · /undo · /redo", "Time Machine file snapshots"),
             ("/after <task>", "queue a task for when Claude finishes"),
+            ("/btw <question>", "side question, answered in a fork"),
+            ("/rename · /queue · /tasks", "name the session · list queue · tasks"),
+            ("/density · /timestamps", "tool-call detail · clock display"),
             ("/narrator", "read each turn's summary aloud"),
         ]),
     ];
@@ -1039,7 +1187,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
     };
     // Side by side when there's room, otherwise one scrollable column.
     let two_cols = area.width as usize >= 2 * col_w + 12;
-    let columns: Vec<Vec<Line>> = if two_cols { vec![render(&groups[..3]), render(&groups[3..])] } else { vec![render(groups)] };
+    let columns: Vec<Vec<Line>> = if two_cols { vec![render(&groups[..2]), render(&groups[2..])] } else { vec![render(groups)] };
     let rows = columns.iter().map(Vec::len).max().unwrap_or(0);
     let width = if two_cols { 2 * col_w + 4 + 4 } else { col_w + 4 };
     let r = centered(area, width as u16, rows as u16 + 4);
@@ -1064,6 +1212,47 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
             Rect { x: r.x + 1, y: r.y + r.height - 1, width: r.width.saturating_sub(3), height: 1 },
         );
     }
+}
+
+fn draw_settings(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {
+    let Overlay::Settings { sel } = app.overlay else { return };
+    dim_background(f.buffer_mut(), area, th);
+    let items = app.settings_items();
+    let sel = sel.min(items.len().saturating_sub(1));
+    let r = centered(area, 84, items.len() as u16 + 6);
+    f.render_widget(Clear, r);
+    let block = modal_block(th, "Settings");
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    // Rows, then a blank line, the key hints and the config file's path.
+    let list_h = inner.height.saturating_sub(3) as usize;
+    let start = sel.saturating_sub(list_h.saturating_sub(1));
+    let w = inner.width as usize;
+    for (row, (i, it)) in items.iter().enumerate().skip(start).take(list_h).enumerate() {
+        let y = inner.y + row as u16;
+        let s = i == sel;
+        let label = format!("{:<20}", it.label);
+        let value = format!("{:<10}", it.value);
+        let mut l = Line::from(vec![
+            Span::styled(if s { "▎" } else { " " }, th.accent()),
+            Span::styled(format!(" {label}"), if s { Style::default().fg(th.text).add_modifier(Modifier::BOLD) } else { Style::default().fg(th.text) }),
+            Span::styled(value, Style::default().fg(if it.value == "off" { th.gray } else { th.accent }).add_modifier(Modifier::BOLD)),
+            Span::styled(truncate(it.hint, w.saturating_sub(34)), th.muted()),
+        ]);
+        if s {
+            l = crate::text::pad_line(l, w, Style::default().bg(th.bg_hover)).style(Style::default().bg(th.bg_hover));
+        }
+        f.render_widget(Paragraph::new(l), Rect { y, height: 1, ..inner });
+        layout.settings_rows.push((y, i));
+    }
+    let hint = hint_line(th, &[("↑↓", "select"), ("Enter / ←→", "change"), ("Esc", "close")]);
+    f.render_widget(Paragraph::new(hint), Rect { y: inner.y + inner.height.saturating_sub(2), height: 1, ..inner });
+    let path = format!("Saved to {}", display_path(&crate::config::config_path()));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(truncate(&path, w), th.dim()))),
+        Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner },
+    );
 }
 
 fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {

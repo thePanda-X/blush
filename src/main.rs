@@ -1,5 +1,6 @@
 mod acp;
 mod app;
+mod attach;
 mod blocks;
 mod config;
 mod files;
@@ -9,7 +10,9 @@ mod launcher;
 mod markdown;
 mod model;
 mod narrator;
+mod notify;
 mod peek;
+mod shell;
 mod text;
 mod theme;
 mod timeline;
@@ -24,12 +27,13 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, EventStream,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
+    EnableMouseCapture, EventStream,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle};
 use crossterm::{cursor, execute};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -163,6 +167,8 @@ fn setup_terminal(mouse: bool) -> Result<(Term, bool)> {
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste, cursor::SetCursorStyle::SteadyBar)?;
+    // Focus reports tell notifications whether you're looking at blush.
+    let _ = execute!(out, EnableFocusChange);
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
@@ -187,6 +193,7 @@ fn restore_terminal(enhanced: bool, mouse: bool) {
     if mouse {
         let _ = execute!(out, DisableMouseCapture);
     }
+    let _ = execute!(out, DisableFocusChange);
     let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, cursor::SetCursorStyle::DefaultUserShape, cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
@@ -257,7 +264,16 @@ async fn run_tui(
             tokio::select! {
                 ev = events.next() => {
                     match ev {
-                        Some(Ok(ev)) => app.on_event(ev).await,
+                        Some(Ok(ev)) => {
+                            // Take everything that's already waiting: on Windows a
+                            // paste arrives as a flood of key presses, which the
+                            // app turns back into one paste.
+                            let mut batch = vec![ev];
+                            while let Some(Some(Ok(more))) = events.next().now_or_never() {
+                                batch.push(more);
+                            }
+                            app.on_events(batch).await;
+                        }
                         Some(Err(_)) | None => break,
                     }
                 }
