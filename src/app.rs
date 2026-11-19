@@ -12,8 +12,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 mod extras;
+mod web;
 
-pub use extras::{Btw, Search, ShellRun};
+pub use extras::{Btw, Search, ShellRun, local_title};
 
 use crate::acp::{self, AcpClient, Incoming, RpcError};
 use crate::attach::{Attached, Attachments};
@@ -57,6 +58,14 @@ pub enum AppMsg {
     BtwDone(u64, Result<Value, RpcError>),
     /// `session/set_title` replied.
     TitleSet(Result<Value, RpcError>),
+    /// The link to the blush web hub came up: where to send updates.
+    WebLinked(mpsc::UnboundedSender<String>),
+    /// The link to the hub went away.
+    WebUnlinked,
+    /// A command from a browser attached to this session.
+    WebCmd(Value),
+    /// The outcome of `/web`, `/web up` or `/web down`.
+    WebInfo(Result<String, String>),
 }
 
 /// A prompt on its way to the agent, with its per-turn overrides.
@@ -361,6 +370,10 @@ pub struct App {
     /// When the last keystroke burst was taken as a paste (its tail may
     /// arrive in the next batch).
     pub last_burst: Option<Instant>,
+    /// The link to the blush web hub, while it's up.
+    pub web: Option<crate::web::sync::WebSync>,
+    /// A headless session opened from the web: it quits when the hub goes away.
+    pub web_hosted: bool,
 }
 
 pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
@@ -400,6 +413,7 @@ pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("thinking", "Show / hide thinking blocks"),
     ("timestamps", "Timestamps: on · minimal · off"),
     ("restart", "Restart the Claude Code agent"),
+    ("web", "Web companion: /web (status) · /web up · /web down"),
     ("login", "Sign in to Claude Code (claude auth login)"),
     ("config", "Open settings (and show the config file)"),
     ("shortcuts", "Keyboard shortcuts"),
@@ -494,6 +508,8 @@ impl App {
             search: None,
             title_override: None,
             last_burst: None,
+            web: None,
+            web_hosted: false,
             config,
         }
     }
@@ -911,6 +927,10 @@ impl App {
                 }
             }
             AppMsg::Acp(inc) => self.on_incoming(inc).await,
+            AppMsg::WebLinked(out) => self.on_web_link(Some(out)),
+            AppMsg::WebUnlinked => self.on_web_link(None),
+            AppMsg::WebCmd(v) => self.on_web_cmd(v).await,
+            AppMsg::WebInfo(r) => self.on_web_info(r),
         }
     }
 
@@ -1443,12 +1463,21 @@ impl App {
     }
 
     fn answer_permission(&mut self, choice: Option<usize>) {
-        let Some(card) = self.permissions.pop_front() else { return };
-        if let Some(next) = self.permissions.front_mut() {
-            next.shown = Instant::now();
+        let oid = choice.and_then(|i| self.permissions.front()?.options.get(i)).map(|o| o.0.clone());
+        self.answer_permission_at(0, oid);
+    }
+
+    /// Answer the permission card at `idx` with the option `choice` (an
+    /// optionId), or reject it when `choice` is None.
+    fn answer_permission_at(&mut self, idx: usize, choice: Option<String>) {
+        let Some(card) = self.permissions.remove(idx) else { return };
+        if idx == 0 {
+            if let Some(next) = self.permissions.front_mut() {
+                next.shown = Instant::now();
+            }
         }
         let Some(client) = self.client.clone() else { return };
-        let outcome = match choice.and_then(|i| card.options.get(i)) {
+        let outcome = match choice.as_ref().and_then(|c| card.options.iter().find(|o| &o.0 == c)) {
             Some((oid, _, _)) => json!({"outcome": {"outcome": "selected", "optionId": oid}}),
             None => {
                 // Esc: prefer an explicit reject option.
@@ -1936,6 +1965,7 @@ impl App {
             "login" => {
                 self.external = Some(External::Login);
             }
+            "web" => self.web_command(args),
             "config" | "settings" => self.open_settings(),
             "shortcuts" | "help" | "keys" => {
                 self.shortcuts_scroll = 0;

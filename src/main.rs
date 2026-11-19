@@ -19,6 +19,7 @@ mod timeline;
 mod ui;
 mod update;
 mod usage;
+mod web;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -42,8 +43,16 @@ use app::{App, AppMsg, External, SessionKind};
 use config::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "blush", version = env!("BLUSH_VERSION"), about = "A Grok-Build-style coding agent TUI for Claude Code (via ACP)")]
+#[command(
+    name = "blush",
+    version = env!("BLUSH_VERSION"),
+    about = "A Grok-Build-style coding agent TUI for Claude Code (via ACP)",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Initial prompt to send once the session is ready.
     prompt: Option<String>,
 
@@ -92,9 +101,44 @@ struct Cli {
     no_update: bool,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// The web companion: attach to sessions from a browser or your phone.
+    Web {
+        #[command(subcommand)]
+        action: Option<WebAction>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum WebAction {
+    /// Show whether the web server is running and where to open it (the default).
+    Status,
+    /// Start the web server in the background.
+    Up,
+    /// Stop the web server (and the sessions it opened).
+    Down,
+    /// Run the web server in the foreground.
+    #[command(hide = true)]
+    Serve,
+    /// Run one session headless, driven from the web (started by the server).
+    #[command(hide = true)]
+    Host {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        resume: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load();
+    if let Some(Command::Web { action }) = cli.command {
+        return run_web(action, config);
+    }
     if cli.update {
         std::process::exit(update::run_now(&config.update));
     }
@@ -149,6 +193,24 @@ async fn run(cli: Cli, mut config: Config) -> Result<()> {
     };
     let pick_session = matches!(&cli.resume, Some(id) if id.is_empty());
     run_tui(config, cwd, startup, cli.prompt, cli.continue_latest, pick_session).await
+}
+
+fn run_web(action: Option<WebAction>, config: Config) -> Result<()> {
+    let rt = || tokio::runtime::Builder::new_multi_thread().enable_all().build();
+    match action {
+        None | Some(WebAction::Status) => std::process::exit(web::cli(Some("status"))),
+        Some(WebAction::Up) => std::process::exit(web::cli(Some("up"))),
+        Some(WebAction::Down) => std::process::exit(web::cli(Some("down"))),
+        Some(WebAction::Serve) => rt()?.block_on(web::hub::serve(config)),
+        Some(WebAction::Host { id, cwd, resume }) => {
+            let kind = match resume {
+                Some(sid) if !sid.is_empty() => SessionKind::Load(sid),
+                _ => SessionKind::New,
+            };
+            markdown::preload();
+            rt()?.block_on(web::host::run_headless(config, dunce_canon(&cwd), kind, id))
+        }
+    }
 }
 
 fn dunce_canon(p: &std::path::Path) -> PathBuf {
@@ -235,6 +297,9 @@ async fn run_tui(
         app.pending_prompt = Some(p);
     }
     app.start_agent();
+    if app.config.web.share {
+        web::host::spawn_bridge(tx.clone(), web::host::new_host_id(), "tui", false);
+    }
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
@@ -285,6 +350,7 @@ async fn run_tui(
                 }
                 _ = ticker.tick() => {
                     app.tick = app.tick.wrapping_add(1);
+                    app.web_sync();
                     if app.tick % 1200 == 0 {
                         // Once a minute: keep the subscription meter fresh while idle.
                         app.maybe_refresh_usage();

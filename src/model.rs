@@ -74,7 +74,13 @@ pub enum Fold {
     Expanded,
 }
 
+/// Source of [`Entry::uid`]: unique for the life of the process.
+static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct Entry {
+    /// Stable identity, kept when entries move (queued prompts) or others are
+    /// removed; the web view syncs by it.
+    pub uid: u64,
     pub block: Block,
     pub time: DateTime<Local>,
     pub fold: Fold,
@@ -103,7 +109,8 @@ impl Entry {
             Block::Tool(_) => Fold::Collapsed,
             _ => Fold::Expanded,
         };
-        Entry { block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false, raw: false }
+        let uid = NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Entry { uid, block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false, raw: false }
     }
 
     pub fn touch(&mut self) {

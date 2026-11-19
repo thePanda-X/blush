@@ -12,7 +12,7 @@ Grok Build's look and feel, with Claude Code doing the work underneath, connecte
 [![Platforms](https://img.shields.io/badge/platforms-windows%20·%20macos%20·%20linux-f2b8cf?style=flat-square&labelColor=1b1b1f)](#install)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2b8cf?style=flat-square&labelColor=1b1b1f)](#license)
 
-[Install](#install) · [Usage](#usage) · [Keys](#keyboard--mouse) · [Commands](#slash-commands) · [Power tools](#power-tools) · [Themes](#themes) · [Config](#configuration) · [How it works](#how-it-works)
+[Install](#install) · [Usage](#usage) · [Web](#blush-web) · [Keys](#keyboard--mouse) · [Commands](#slash-commands) · [Power tools](#power-tools) · [Themes](#themes) · [Config](#configuration) · [How it works](#how-it-works)
 
 </div>
 
@@ -132,12 +132,53 @@ blush --no-mouse                   # keep your terminal's native selection
 blush --update-adapter             # reinstall the latest Claude Code ACP adapter
 blush --update                     # update blush itself to the latest commit and exit
 blush --no-update                  # skip the launch-time update check once
+blush web up                       # start the web companion (see below)
 ```
 
 When you quit, blush prints a `blush --resume <id>` line so you can return to the session later.
 
 In headless mode (`-p`), the agent's text goes to **stdout** and tool activity goes to **stderr**.
 That means `blush -p "…" > answer.md` saves only the answer.
+
+## blush web
+
+`blush web` lets you follow and drive your sessions from a browser, for example from your phone
+while Claude works on your desktop.
+
+```sh
+blush web          # is it running, and where to open it
+blush web up       # start the server in the background (prints links and a QR code)
+blush web down     # stop it, along with any sessions it opened
+```
+
+`/web`, `/web up`, and `/web down` do the same from inside the TUI.
+
+- **Attach to running sessions.** While the server is up, every blush TUI shares its session.
+  Pick one under **Live** to watch it stream and to send prompts, stop a turn, answer
+  permission requests and questions, or switch the model, effort, and permission mode. The
+  terminal shows everything you do from the web, and the web shows everything you type in the terminal.
+  **Detach** (or the back button on a phone) leaves the session running.
+- **Open any other session.** **Recent** lists past sessions from every project. Opening one
+  starts it on this machine without a terminal, and **New** starts a fresh one in a folder you
+  choose. These sessions are tagged `web`, and **End session** stops them.
+- **The same look.** The web app uses blush's themes, which follow `ui.theme` by default, and
+  you can pick another one per browser.
+
+The first link `blush web up` prints carries an access token. Opening it stores the token in a
+cookie, so you can bookmark the plain address afterwards. The token lives in
+`~/.blush/web/token`; delete that file and restart the server to revoke every browser.
+
+> **Security.** Anyone with the link can run Claude Code on this computer, with your
+> permissions. The server listens on your local network over plain HTTP. Use it on a network
+> you trust (or over a VPN such as Tailscale), or set `web.bind = "127.0.0.1"` to keep it on
+> this machine.
+
+```toml
+[web]
+port = 4777          # where the server listens
+bind = "0.0.0.0"     # "127.0.0.1" keeps it to this machine
+share = true         # share running TUI sessions while the server is up
+```
 
 ## Keyboard & mouse
 
@@ -200,6 +241,7 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `/timestamps [on\|minimal\|off]` | Clock times on every entry, on prompts only, or nowhere. No argument toggles |
 | `/density [detailed\|balanced\|diff\|grouped]` | How much of each tool call shows (see [Density](#density)). No argument opens a chooser |
 | `/restart` | Restart the agent process |
+| `/web` · `/web up` · `/web down` | Web companion status, start, stop (see [blush web](#blush-web)) |
 | `/login` | Run `claude auth login` without leaving blush |
 | `/settings` (`/config`) | Open the settings modal (`F2`) |
 | `/shortcuts` (`/help`, `/keys`) | Show the shortcut overlay |
@@ -440,6 +482,11 @@ token_meter = true    # per-turn and session token counts
 timeline = true       # Time Machine snapshots after each turn
 notify = true         # chime when Claude finishes or needs you
 
+[web]
+port = 4777           # blush web: where the server listens
+bind = "0.0.0.0"      # "127.0.0.1" keeps it on this machine
+share = true          # share running TUI sessions with the web
+
 [update]
 auto = true                  # check GitHub on launch and self-update
 repo = "thePanda-X/blush"    # where updates come from
@@ -460,6 +507,8 @@ branch = "main"
 | `~/.blush/adapter/` | The npm install of the ACP adapter that blush manages |
 | `~/.blush/src/` | The source checkout that self-updates build from |
 | `~/.blush/logs/update.log` | Output from failed self-updates |
+| `~/.blush/web/` | blush web: the access token and the running server's port and pid |
+| `~/.blush/logs/web.log` | blush web server and web-opened session logs |
 
 ### About bypass mode
 
@@ -492,6 +541,8 @@ default mode instead.
 | [`src/narrator.rs`](src/narrator.rs), [`src/peek.rs`](src/peek.rs) | Text-to-speech summaries, and opening or revealing files. |
 | [`src/app/extras.rs`](src/app/extras.rs) | The command palette, find, stash, send-now, queue editing, shell mode, `/btw`, `/rename`, density, the panes, settings, and notifications. |
 | [`src/attach.rs`](src/attach.rs), [`src/shell.rs`](src/shell.rs), [`src/notify.rs`](src/notify.rs) | Image and long-paste attachments, running `!` commands, and the notification chime. |
+| [`src/web/`](src/web) | blush web: the hub server (`hub.rs`), the link each session keeps to it and the headless runner (`host.rs`), and transcript diffs (`sync.rs`) |
+| [`web/`](web) | The web app: Bun, React, Tailwind, and Radix UI. `make web` builds it into `web/dist`, which is embedded in the binary |
 | [`src/update.rs`](src/update.rs), [`build.rs`](build.rs) | The self-updater: compares the build's git commit with GitHub, rebuilds from source, swaps the binary, and plays the update animation. |
 
 ## Troubleshooting
@@ -509,6 +560,8 @@ default mode instead.
 cargo run -- "hello"     # debug build
 cargo test               # unit tests
 make                     # release build and install
+make web                 # rebuild the web app (needs bun), then cargo build to embed it
+cd web && node e2e/run.ts   # end-to-end web tests against a scripted mock agent (Windows)
 ```
 
 ## License

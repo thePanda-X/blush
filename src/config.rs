@@ -13,6 +13,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub features: FeaturesConfig,
     pub update: UpdateConfig,
+    pub web: WebConfig,
     /// Set when the file existed but couldn't be parsed (shown in the TUI,
     /// where a plain stderr line would vanish behind the alternate screen).
     #[serde(skip)]
@@ -38,6 +39,25 @@ pub struct FeaturesConfig {
 impl Default for FeaturesConfig {
     fn default() -> Self {
         FeaturesConfig { narrator: false, sub_meter: true, token_meter: true, timeline: true, notify: true }
+    }
+}
+
+/// `blush web up`: the browser companion (attach to sessions from a phone).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Port the web server listens on.
+    pub port: u16,
+    /// Address to bind. `0.0.0.0` makes it reachable from other devices on
+    /// your network (your phone); `127.0.0.1` keeps it on this machine.
+    pub bind: String,
+    /// Share running TUI sessions with the web server while it's up.
+    pub share: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig { port: 4777, bind: "0.0.0.0".into(), share: true }
     }
 }
 
@@ -149,7 +169,7 @@ impl Default for AgentConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default(), update: UpdateConfig::default(), load_warning: None }
+        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default(), update: UpdateConfig::default(), web: WebConfig::default(), load_warning: None }
     }
 }
 

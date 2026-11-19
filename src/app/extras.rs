@@ -1132,7 +1132,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Outgoing, SessionKind};
+    use crate::app::{Outgoing, PermissionCard, SessionKind};
     use crossterm::event::{Event, KeyEventKind, KeyEventState, KeyModifiers};
 
     /// Keep tests away from the real ~/.blush (config, history, titles).
@@ -1176,6 +1176,73 @@ mod tests {
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn web_qr_notice_renders_intact() {
+        let (mut app, _rx) = app();
+        let code = crate::web::qr("http://192.168.1.45:4777/?token=0123456789abcdef0123456789abcdef").unwrap();
+        app.on_web_info(Ok(format!("blush web is up
+
+{code}
+Stop it with `blush web down`.")));
+        let out = screen(&mut app, 120, 60);
+        for row in code.lines() {
+            assert!(out.contains(row.trim_end()), "QR row mangled: {row:?}
+{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn web_sync_sends_snapshot_then_diffs() {
+        let (mut app, _rx) = app();
+        let (tx, mut out) = tokio::sync::mpsc::unbounded_channel::<String>();
+        app.on_web_link(Some(tx));
+        let first: Value = serde_json::from_str(&out.try_recv().unwrap()).unwrap();
+        assert_eq!(first["t"], "snapshot");
+        // An appended entry goes out as an upsert, with no reorder.
+        let idx = app.transcript.push(Block::Agent { text: "hello".into() });
+        app.web_sync();
+        let m: Value = serde_json::from_str(&out.try_recv().unwrap()).unwrap();
+        assert_eq!(m["t"], "upsert");
+        assert_eq!(m["entries"][0]["text"], "hello");
+        // Growing text re-sends just that entry.
+        if let Block::Agent { text } = &mut app.transcript.entries[idx].block {
+            text.push_str(" there");
+        }
+        app.transcript.entries[idx].touch();
+        app.web_sync();
+        let m: Value = serde_json::from_str(&out.try_recv().unwrap()).unwrap();
+        assert_eq!(m["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(m["entries"][0]["text"], "hello there");
+        // Nothing changed: nothing sent.
+        app.web_sync();
+        assert!(out.try_recv().is_err());
+        // A removal sends the new order.
+        app.transcript.entries.remove(idx);
+        app.web_sync();
+        let m: Value = serde_json::from_str(&out.try_recv().unwrap()).unwrap();
+        assert_eq!(m["t"], "order");
+        assert_eq!(m["uids"].as_array().unwrap().len(), app.transcript.entries.len());
+    }
+
+    #[tokio::test]
+    async fn web_commands_answer_permissions_by_id() {
+        let (mut app, _rx) = app();
+        for n in 0..2 {
+            app.permissions.push_back(PermissionCard {
+                id: json!(n),
+                title: format!("card {n}"),
+                detail: vec![],
+                options: vec![("ok".into(), "Allow".into(), "allow_once".into())],
+                sel: 0,
+                shown: Instant::now(),
+            });
+        }
+        // Answering the second card leaves the first waiting.
+        app.on_web_cmd(json!({"t": "permission", "id": 1, "optionId": "ok"})).await;
+        assert_eq!(app.permissions.len(), 1);
+        assert_eq!(app.permissions[0].id, json!(0));
     }
 
     #[tokio::test]

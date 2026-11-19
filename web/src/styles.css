@@ -1,0 +1,194 @@
+@import "tailwindcss";
+
+/* blush's palette. The server sends every theme; lib/theme.ts writes the
+   chosen one into these variables. Defaults are the `blush` theme. */
+:root {
+  --bg: #1b1b1f;
+  --bg-raised: #26262b;
+  --bg-hover: #302f36;
+  --text: #e8e6ea;
+  --text-secondary: #ccc9cf;
+  --gray-dim: #5c5b63;
+  --gray: #78767f;
+  --gray-bright: #939099;
+  --accent: #f2b8cf;
+  --accent-thinking: #e3a0c4;
+  --success: #9ece8a;
+  --error: #f7768e;
+  --warning: #e8c07d;
+  --info: #a8c0f0;
+  --path: #f5c6a5;
+  --command: #e8cf95;
+  --link: #e4a3e0;
+  --model: #f2b8cf;
+  --plan: #ffdb8d;
+  --border: #36353c;
+  --border-active: #6a4a5b;
+  --diff-ins-bg: #1e3326;
+  --diff-ins-fg: #9ece8a;
+  --diff-del-bg: #3e1e29;
+  --diff-del-fg: #f7768e;
+  --h1: #ff8fc0;
+  --h2: #f2b8cf;
+  --h3: #f7ccde;
+  --h4: #c99ab1;
+  --code-inline: #f7a1c8;
+  --md-text: #e2d9de;
+  --md-bullet: #f2b8cf;
+  --md-strong: #fad4e4;
+  --md-quote-bar: #a86580;
+  --md-quote-text: #d9b3c6;
+  --md-rule: #7a4e63;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-raised: var(--bg-raised);
+  --color-hover: var(--bg-hover);
+  --color-fg: var(--text);
+  --color-fg2: var(--text-secondary);
+  --color-dim: var(--gray-dim);
+  --color-muted: var(--gray);
+  --color-soft: var(--gray-bright);
+  --color-accent: var(--accent);
+  --color-think: var(--accent-thinking);
+  --color-ok: var(--success);
+  --color-bad: var(--error);
+  --color-warn: var(--warning);
+  --color-info: var(--info);
+  --color-path: var(--path);
+  --color-cmd: var(--command);
+  --color-link: var(--link);
+  --color-model: var(--model);
+  --color-plan: var(--plan);
+  --color-line: var(--border);
+  --color-line-active: var(--border-active);
+  --color-ins-bg: var(--diff-ins-bg);
+  --color-ins: var(--diff-ins-fg);
+  --color-del-bg: var(--diff-del-bg);
+  --color-del: var(--diff-del-fg);
+  --color-md: var(--md-text);
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SF Mono", ui-monospace, Menlo, Consolas, "Roboto Mono", "Droid Sans Mono", monospace;
+  --font-sans: var(--font-mono);
+  --animate-pulse-soft: pulse-soft 1.4s ease-in-out infinite;
+  @keyframes pulse-soft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+@media (max-width: 640px) {
+  body { font-size: 13.5px; }
+}
+::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--text); }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+
+/* Rendered markdown, styled like the TUI's renderer. */
+.md { color: var(--md-text); overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md table, .md blockquote { margin: 0.55em 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-weight: 700; margin: 0.9em 0 0.4em; line-height: 1.35; font-size: 1em; }
+.md h1 { color: var(--h1); }
+.md h2 { color: var(--h2); }
+.md h3 { color: var(--h3); }
+.md h4, .md h5, .md h6 { color: var(--h4); }
+.md h1::before { content: "# "; opacity: 0.55; }
+.md h2::before { content: "## "; opacity: 0.55; }
+.md h3::before { content: "### "; opacity: 0.55; }
+.md strong { color: var(--md-strong); font-weight: 700; }
+.md em { font-style: italic; }
+.md a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
+.md ul, .md ol { padding-left: 1.6em; }
+.md ul { list-style: none; }
+.md ul > li { position: relative; }
+.md ul > li::before { content: "•"; color: var(--md-bullet); position: absolute; left: -1.1em; }
+.md ul > li:has(.task)::before { content: none; }
+.md ol { list-style: decimal; }
+.md ol > li::marker { color: var(--md-bullet); }
+.md .task { color: var(--md-bullet); display: inline-block; width: 1.1em; margin-left: -1.1em; }
+.md .task.done { color: var(--success); }
+.md li + li { margin-top: 0.15em; }
+.md blockquote { border-left: 2px solid var(--md-quote-bar); padding-left: 0.9em; color: var(--md-quote-text); }
+.md hr { border: 0; border-top: 1px solid var(--md-rule); margin: 1em 0; }
+.md code { color: var(--code-inline); font-family: inherit; }
+.md pre { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px; padding: 0.7em 0.9em; overflow-x: auto; line-height: 1.45; position: relative; }
+.md pre code { color: var(--text); }
+.md pre[data-lang]::after { content: attr(data-lang); position: absolute; top: 0.35em; right: 0.6em; font-size: 0.75em; color: var(--md-rule); }
+.md table { border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%; }
+.md th, .md td { border: 1px solid var(--md-rule); padding: 0.25em 0.7em; text-align: left; }
+.md th { color: var(--h2); font-weight: 700; }
+.md img { max-width: 100%; }
+
+/* Syntax colors drawn from the theme. */
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-type { color: var(--accent); }
+.hljs-string, .hljs-attr-value, .hljs-regexp, .hljs-addition { color: var(--success); }
+.hljs-number, .hljs-literal, .hljs-symbol { color: var(--path); }
+.hljs-comment, .hljs-quote, .hljs-meta { color: var(--gray); font-style: italic; }
+.hljs-title, .hljs-title.function_, .hljs-section { color: var(--info); }
+.hljs-attr, .hljs-variable, .hljs-template-variable, .hljs-property, .hljs-params { color: var(--command); }
+.hljs-deletion { color: var(--error); }
+.hljs-name, .hljs-tag { color: var(--link); }
+
+/* Radix menus and dialogs share these surfaces. */
+.menu {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-active);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 210px;
+  max-width: calc(100vw - 16px);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 0.45);
+  z-index: 50;
+  max-height: var(--radix-dropdown-menu-content-available-height);
+  overflow-y: auto;
+  animation: fade-in 100ms ease-out;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  outline: none;
+  cursor: pointer;
+  color: var(--text);
+  user-select: none;
+}
+.menu-item[data-highlighted] { background: var(--bg-hover); }
+.menu-item[data-disabled] { color: var(--gray-dim); cursor: default; }
+.menu-label { padding: 6px 10px 4px; color: var(--gray); font-size: 0.85em; }
+.menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rise-in { from { opacity: 0; transform: translate(-50%, -48%) scale(0.98); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes slide-in { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+@keyframes slide-up { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.overlay { position: fixed; inset: 0; background: rgb(0 0 0 / 0.55); animation: fade-in 120ms ease-out; z-index: 40; }
+.dialog {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(92vw, 520px); max-height: 85dvh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--border-active); border-radius: 10px;
+  padding: 20px; z-index: 50; animation: rise-in 140ms ease-out;
+  box-shadow: 0 20px 60px rgb(0 0 0 / 0.5);
+}
+.toast { animation: slide-up 140ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

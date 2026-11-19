@@ -7,6 +7,7 @@
 #   make adapter      pre-install / update the Claude Code ACP adapter
 #   make check        verify prerequisites (cargo, node, npm, claude)
 #   make test         run unit tests
+#   make web          rebuild the web companion (needs bun; the built files are committed)
 #   make clean        cargo clean
 #
 # Override the install location with BINDIR=..., e.g.
@@ -36,7 +37,7 @@ BINDIR ?= $(CARGO_HOME)\bin
 BIN := target\release\$(APP)$(EXE)
 DEST := $(BINDIR)\$(APP)$(EXE)
 
-.PHONY: all build install uninstall adapter check test clean
+.PHONY: all build install uninstall adapter check test clean web
 
 all: install
 
@@ -67,6 +68,9 @@ adapter: build
 test:
 	cargo test
 
+web:
+	cd web; bun install; bun run build
+
 clean:
 	cargo clean
 
@@ -78,7 +82,7 @@ BINDIR ?= $(CARGO_HOME)/bin
 BIN := target/release/$(APP)
 DEST := $(BINDIR)/$(APP)
 
-.PHONY: all build install uninstall adapter check test clean
+.PHONY: all build install uninstall adapter check test clean web
 
 all: install
 
@@ -111,6 +115,9 @@ adapter: build
 
 test:
 	cargo test
+
+web:
+	cd web && bun install && bun run build
 
 clean:
 	cargo clean
