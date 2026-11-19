@@ -53,7 +53,8 @@ impl Timeline {
                 let index = PathBuf::from(dir.trim()).join("blush-timeline.index");
                 self.repo = Some(Repo { top, index });
             }
-            self.ref_name = format!("refs/blush/timeline/{}", Local::now().format("%Y%m%d-%H%M%S"));
+            // The pid keeps two sessions started in the same second apart.
+            self.ref_name = format!("refs/blush/timeline/{}-{}", Local::now().format("%Y%m%d-%H%M%S"), std::process::id());
         }
         self.repo.clone()
     }

@@ -30,18 +30,28 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // ---- vertical layout ----
     let prompt_inner_w = area.width.saturating_sub(4 + 2) as usize; // borders + padding + arrow
-    let input_rows = app.input.layout(prompt_inner_w.max(1)).len().clamp(1, 10) as u16;
-    let prompt_h = input_rows + 2;
-    let card_lines = card_lines(app, &th, area.width.saturating_sub(4) as usize);
-    let card_h = if card_lines.is_empty() {
-        0
-    } else {
-        (card_lines.len() as u16 + 2).min(area.height.saturating_sub(prompt_h + 6))
-    };
     let footer_h = 1;
     let status_h = 1;
     let header_h = 1;
     let gap = 1;
+    let chrome = header_h + gap + status_h + footer_h;
+    let card_lines = card_lines(app, &th, area.width.saturating_sub(4) as usize);
+    // Everything below must fit in `area.height`: the prompt gives up rows
+    // first (it scrolls to the cursor), then the scrollback, and a pending
+    // card always keeps at least its frame plus one line.
+    let card_min: u16 = if card_lines.is_empty() { 0 } else { 3 };
+    let max_input = area.height.saturating_sub(chrome + 2 + card_min + 1).clamp(1, 10) as usize;
+    let input_rows = app.input.layout(prompt_inner_w.max(1)).len().clamp(1, max_input) as u16;
+    let prompt_h = input_rows + 2;
+    let room = area.height.saturating_sub(chrome + prompt_h);
+    let card_h = if card_lines.is_empty() {
+        0
+    } else {
+        let want = card_lines.len() as u16 + 2;
+        // Leave a few scrollback rows when there's space, but never squeeze
+        // the card below a usable size.
+        want.min(room.saturating_sub(4).max(want.min(8))).min(room)
+    };
     let fixed = header_h + gap + status_h + card_h + prompt_h + footer_h;
     let scroll_h = area.height.saturating_sub(fixed);
 
@@ -73,8 +83,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.overlay {
         Overlay::None => {}
         Overlay::Picker(_) => draw_picker(f, app, &th, full),
-        Overlay::Shortcuts => draw_shortcuts(f, app, &th, full),
-        Overlay::Viewer { .. } => draw_viewer(f, app, &th, full),
+        Overlay::Shortcuts => draw_shortcuts(f, app, &th, full, &mut layout),
+        Overlay::Viewer { .. } => draw_viewer(f, app, &th, full, &mut layout),
     }
     app.layout = layout;
 }
@@ -381,7 +391,7 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         Conn::Failed(e) => {
             left.push(Span::styled("✗ ", Style::default().fg(th.error)));
             left.push(Span::styled(
-                truncate(e.lines().next().unwrap_or(""), r.width as usize - 20),
+                truncate(e.lines().next().unwrap_or(""), (r.width as usize).saturating_sub(20)),
                 Style::default().fg(th.error),
             ));
             left.push(Span::styled("  /restart", th.muted()));
@@ -425,7 +435,7 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         }
         right.extend(context_meter(app, th));
         right.push(Span::styled(
-            format!("{} ⇣{} ", human_duration_short(elapsed), human_tokens((app.turn_chars / 4) as u64)),
+            format!("⇣{} ", human_tokens((app.turn_chars / 4) as u64)),
             th.muted(),
         ));
         right.push(Span::styled("[stop]", Style::default().fg(th.gray_bright)));
@@ -599,13 +609,16 @@ fn draw_card(f: &mut Frame, app: &App, th: &Theme, r: Rect, lines: Vec<Line<'sta
     f.render_widget(block, r);
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
     // Keep the options (bottom) visible if the card is clipped.
-    let skip = lines.len().saturating_sub(inner.height as usize);
-    let lines: Vec<Line> = if skip > 0 {
+    let h = inner.height as usize;
+    let lines: Vec<Line> = if lines.len() <= h {
+        lines
+    } else if h >= 2 {
+        // Keep the title line, then as much of the bottom as fits.
         let mut v = lines[..1].to_vec();
-        v.extend(lines[skip + 1..].iter().cloned());
+        v.extend(lines[lines.len() - (h - 1)..].iter().cloned());
         v
     } else {
-        lines
+        lines[lines.len() - h..].to_vec()
     };
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -668,11 +681,7 @@ fn draw_prompt(f: &mut Frame, app: &App, th: &Theme, r: Rect, inner_w: usize) {
         let y = inner.y + (i - first) as u16;
         let seg = &app.input.text[*s..*e];
         let seg = seg.trim_end_matches('\n');
-        let style = if app.input.text.starts_with('/') && i == 0 {
-            Style::default().fg(th.text)
-        } else {
-            Style::default().fg(th.text)
-        };
+        let style = Style::default().fg(th.text);
         // Highlight @mentions and a leading /command.
         let mut x = text_x;
         for word in split_keep_ws(seg) {
@@ -726,7 +735,7 @@ fn hint_line(th: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
 
 fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut LayoutInfo) {
     let hints: Vec<(&str, &str)> = if !app.permissions.is_empty() {
-        vec![("↑↓", "select"), ("Enter", "confirm"), ("1-9", "pick"), ("Esc", "deny"), ("Ctrl+c", "cancel turn")]
+        vec![("↑↓", "select"), ("Enter", "confirm"), ("1-9", "pick"), ("Esc", "deny"), ("Ctrl+C", "stop turn")]
     } else if app.question.is_some() {
         vec![("↑↓", "select"), ("Space", "toggle"), ("Enter", "confirm"), ("Esc", "dismiss")]
     } else if app.completion.is_some() {
@@ -735,10 +744,12 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         vec![("o", "open"), ("r", "reveal"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
     } else if app.focus == Focus::Scrollback {
         vec![("↑↓", "select"), ("←→", "fold"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
+    } else if app.queue_paused && app.input.is_empty() {
+        vec![("Enter", "send queued"), ("Ctrl+C", "drop queued"), ("Ctrl+.", "shortcuts")]
     } else if app.responding {
-        vec![("Shift+Tab", "mode"), ("Ctrl+c", "cancel"), ("Enter", "queue"), ("Ctrl+.", "shortcuts")]
+        vec![("Ctrl+C", "stop"), ("Enter", "queue"), ("Shift+Tab", "mode"), ("Ctrl+.", "shortcuts")]
     } else {
-        vec![("Shift+Tab", "mode"), ("Ctrl+c", "cancel"), ("Ctrl+.", "shortcuts")]
+        vec![("Shift+Tab", "mode"), ("@", "files"), ("/", "commands"), ("Ctrl+.", "shortcuts")]
     };
     // Right side: subscription meter, then the narrator toggle.
     let mut right: Vec<Span> = Vec::new();
@@ -831,6 +842,9 @@ fn draw_completion(f: &mut Frame, app: &App, th: &Theme, prompt: Rect) {
                     Some((d, n)) => (format!("{d}/"), format!("{n}{}", if p.ends_with('/') { "/" } else { "" })),
                     None => (String::new(), p.clone()),
                 };
+                // The file name is what matters: shorten the directory from the left.
+                let room = (prompt.width as usize).saturating_sub(4 + crate::text::width(&name));
+                let dir = if crate::text::width(&dir) > room { crate::text::truncate_left(&dir, room) } else { dir };
                 let mut l = Line::from(vec![
                     Span::styled(if s { "▎" } else { " " }, th.accent()),
                     Span::styled("@", th.dim()),
@@ -925,7 +939,12 @@ fn draw_picker(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             Span::styled(if s { "▎" } else { " " }, th.accent()),
             Span::styled(mark, th.accent()),
             Span::styled(
-                format!("{:<label_w$}", truncate(&it.label, label_w)),
+                {
+                    // Pad by display width so CJK / emoji titles keep the columns aligned.
+                    let t = truncate(&it.label, label_w);
+                    let pad = label_w.saturating_sub(crate::text::width(&t));
+                    format!("{t}{}", " ".repeat(pad))
+                },
                 if s { Style::default().fg(th.accent).add_modifier(Modifier::BOLD) } else { Style::default().fg(th.text) },
             ),
         ];
@@ -947,7 +966,7 @@ fn draw_picker(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     f.render_widget(Paragraph::new(hint), Rect { y: inner.y + inner.height - 1, height: 1, ..inner });
 }
 
-fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
+fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {
     dim_background(f.buffer_mut(), area, th);
     let groups: &[(&str, &[(&str, &str)])] = &[
         ("Prompt", &[
@@ -998,32 +1017,60 @@ fn draw_shortcuts(f: &mut Frame, _app: &App, th: &Theme, area: Rect) {
             ("/narrator", "read each turn's summary aloud"),
         ]),
     ];
-    let mut lines = Vec::new();
-    for (gi, (g, items)) in groups.iter().enumerate() {
-        if gi > 0 {
-            lines.push(Line::default());
+    let key_w = groups.iter().flat_map(|(_, items)| items.iter()).map(|(k, _)| crate::text::width(k)).max().unwrap_or(0) + 2;
+    let desc_w = groups.iter().flat_map(|(_, items)| items.iter()).map(|(_, v)| crate::text::width(v)).max().unwrap_or(0);
+    let col_w = 2 + key_w + desc_w;
+    let render = |gs: &[(&str, &[(&str, &str)])]| {
+        let mut lines = Vec::new();
+        for (gi, (g, items)) in gs.iter().enumerate() {
+            if gi > 0 {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled(g.to_string(), Style::default().fg(th.h2).add_modifier(Modifier::BOLD))));
+            for (k, v) in *items {
+                let pad = key_w.saturating_sub(crate::text::width(k));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {k}{}", " ".repeat(pad)), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+                    Span::styled(v.to_string(), th.muted()),
+                ]));
+            }
         }
-        lines.push(Line::from(Span::styled(g.to_string(), Style::default().fg(th.h2).add_modifier(Modifier::BOLD))));
-        for (k, v) in *items {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {k:<30}"), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
-                Span::styled(v.to_string(), th.muted()),
-            ]));
-        }
-    }
-    let r = centered(area, 76, lines.len() as u16 + 4);
+        lines
+    };
+    // Side by side when there's room, otherwise one scrollable column.
+    let two_cols = area.width as usize >= 2 * col_w + 12;
+    let columns: Vec<Vec<Line>> = if two_cols { vec![render(&groups[..3]), render(&groups[3..])] } else { vec![render(groups)] };
+    let rows = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let width = if two_cols { 2 * col_w + 4 + 4 } else { col_w + 4 };
+    let r = centered(area, width as u16, rows as u16 + 4);
     f.render_widget(Clear, r);
     let block = modal_block(th, "Shortcuts");
     let inner = block.inner(r);
     f.render_widget(block, r);
-    f.render_widget(Paragraph::new(lines), Rect { x: inner.x + 1, y: inner.y + 1, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(1) });
+    let body = Rect { x: inner.x + 1, y: inner.y + 1, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(1) };
+    let max = rows.saturating_sub(body.height as usize);
+    layout.shortcuts_max = max;
+    let top = app.shortcuts_scroll.min(max);
+    for (ci, col) in columns.into_iter().enumerate() {
+        let x = body.x + (ci * (col_w + 4)) as u16;
+        let col_area = Rect { x, width: body.width.saturating_sub(x - body.x), ..body };
+        let vis: Vec<Line> = col.into_iter().skip(top).take(body.height as usize).collect();
+        f.render_widget(Paragraph::new(vis), col_area);
+    }
+    if max > 0 {
+        let more = if top < max { " ↓ more · ↑↓ scroll " } else { " ↑ scroll " };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(more, th.muted())).alignment(Alignment::Right)),
+            Rect { x: r.x + 1, y: r.y + r.height - 1, width: r.width.saturating_sub(3), height: 1 },
+        );
+    }
 }
 
-fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {
     let Overlay::Viewer { title, text, scroll } = &app.overlay else { return };
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     f.render_widget(Clear, r);
-    let block = modal_block(th, &truncate(title, r.width as usize - 6))
+    let block = modal_block(th, &truncate(title, (r.width as usize).saturating_sub(6)))
         .title_bottom(hint_line(th, &[("↑↓", "scroll"), ("y", "copy"), ("Esc", "close")]).alignment(Alignment::Right))
         .style(th.base());
     let inner = block.inner(r);
@@ -1031,6 +1078,8 @@ fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
     let lines = crate::markdown::render(text, inner.width as usize, th);
     let max = lines.len().saturating_sub(inner.height as usize);
+    layout.viewer_max = max;
+    layout.viewer_page = inner.height as usize;
     let s = (*scroll).min(max);
     let vis: Vec<Line> = lines.into_iter().skip(s).take(inner.height as usize).collect();
     f.render_widget(Paragraph::new(vis), inner);
@@ -1084,5 +1133,52 @@ mod tests {
         let open = screen(&mut app, 70, 22);
         println!("--- group expanded ---\n{open}");
         assert!(open.contains("▾ 1 tool · 1 thought · 1 edit") && open.contains("Read calc.py"), "{open}");
+    }
+
+    #[test]
+    fn tiny_terminals_never_panic() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), std::env::temp_dir(), tx, SessionKind::New);
+        app.input.set(&(0..12).map(|i| format!("line {i}")).collect::<Vec<_>>().join("
+"));
+        app.permissions.push_back(crate::app::PermissionCard {
+            id: json!(1),
+            title: "Run cargo test".into(),
+            detail: vec!["cargo test --all".into(); 4],
+            options: vec![
+                ("a".into(), "Allow".into(), "allow_once".into()),
+                ("r".into(), "Reject".into(), "reject_once".into()),
+            ],
+            sel: 0,
+            shown: std::time::Instant::now(),
+        });
+        app.conn = crate::app::Conn::Failed("adapter crashed with a long message".into());
+        for w in [20u16, 21, 30, 40, 80] {
+            for h in 8u16..=24 {
+                screen(&mut app, w, h);
+            }
+        }
+        // The card's options stay visible even when it has to be clipped.
+        let small = screen(&mut app, 60, 14);
+        assert!(small.contains("Reject"), "{small}");
+    }
+
+    #[test]
+    fn shortcuts_overlay_fits_or_scrolls() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), std::env::temp_dir(), tx, SessionKind::New);
+        app.overlay = Overlay::Shortcuts;
+        // Wide: two columns, everything visible at once.
+        let wide = screen(&mut app, 180, 40);
+        println!("{wide}");
+        assert!(wide.contains("Quick commands") && wide.contains("/narrator"), "{wide}");
+        assert_eq!(app.layout.shortcuts_max, 0);
+        // Narrow and short: one column that scrolls to the end.
+        let narrow = screen(&mut app, 100, 30);
+        println!("{narrow}");
+        assert!(narrow.contains("↓ more"), "{narrow}");
+        app.shortcuts_scroll = app.layout.shortcuts_max;
+        let end = screen(&mut app, 100, 30);
+        assert!(end.contains("/narrator"), "{end}");
     }
 }

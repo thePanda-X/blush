@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Theme: blush | night | rosepine | day | terminal
+    /// Theme: blush | blush-light | night | rosepine | day | terminal
     #[arg(long)]
     theme: Option<String>,
 
@@ -88,6 +88,10 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     let mut config = Config::load();
     if let Some(t) = &cli.theme {
+        if theme::Theme::by_name(t).is_none() {
+            let names: Vec<&str> = theme::THEME_NAMES.iter().map(|(n, _)| *n).collect();
+            anyhow::bail!("unknown theme `{t}` (choose from: {})", names.join(", "));
+        }
         config.ui.theme = t.clone();
     }
     if let Some(m) = &cli.mode {
@@ -100,6 +104,7 @@ async fn run(cli: Cli) -> Result<()> {
         config.ui.mouse = false;
     }
     let cwd = match &cli.cwd {
+        Some(p) if !p.is_dir() => anyhow::bail!("--cwd {}: no such directory", p.display()),
         Some(p) => dunce_canon(p),
         None => std::env::current_dir()?,
     };
@@ -179,8 +184,19 @@ async fn run_tui(
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore_terminal(true, true);
-            default_hook(info);
+            // A panic in a background task is caught by tokio and the UI keeps
+            // running, so only tear the terminal down when it's fatal: on the
+            // thread driving the UI. Anything else is logged instead.
+            if std::thread::current().name() == Some("main") {
+                restore_terminal(true, true);
+                default_hook(info);
+            } else {
+                let log = config::home_dir().join("logs").join("panic.log");
+                let _ = std::fs::create_dir_all(log.parent().unwrap());
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+                    let _ = writeln!(f, "[{}] {info}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+                }
+            }
         }));
     }
 
@@ -198,76 +214,82 @@ async fn run_tui(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_title = String::new();
 
-    loop {
-        if app.take_force_redraw() {
-            term.clear()?;
-        }
-        if app.dirty {
-            app.dirty = false;
-            term.draw(|f| ui::draw(f, &mut app))?;
-            let title = if app.responding {
-                format!("Responding - {}", app.terminal_title)
-            } else {
-                app.terminal_title.clone()
-            };
-            if title != last_title {
-                last_title = title;
-                let _ = execute!(io::stdout(), SetTitle(&last_title));
+    // Run the loop in a block so that an I/O error from drawing still falls
+    // through to the agent shutdown and terminal restore below.
+    let result: Result<()> = async {
+        loop {
+            if app.take_force_redraw() {
+                term.clear()?;
             }
-        }
-        tokio::select! {
-            ev = events.next() => {
-                match ev {
-                    Some(Ok(ev)) => app.on_event(ev).await,
-                    Some(Err(_)) | None => break,
+            if app.dirty {
+                app.dirty = false;
+                term.draw(|f| ui::draw(f, &mut app))?;
+                let title = if app.responding {
+                    format!("Responding - {}", app.terminal_title)
+                } else {
+                    app.terminal_title.clone()
+                };
+                if title != last_title {
+                    last_title = title;
+                    let _ = execute!(io::stdout(), SetTitle(&last_title));
                 }
             }
-            Some(msg) = rx.recv() => {
-                app.on_msg(msg).await;
-                while let Ok(m) = rx.try_recv() {
-                    app.on_msg(m).await;
+            tokio::select! {
+                ev = events.next() => {
+                    match ev {
+                        Some(Ok(ev)) => app.on_event(ev).await,
+                        Some(Err(_)) | None => break,
+                    }
                 }
-            }
-            _ = ticker.tick() => {
-                app.tick = app.tick.wrapping_add(1);
-                if app.tick % 1200 == 0 {
-                    // Once a minute: keep the subscription meter fresh while idle.
-                    app.maybe_refresh_usage();
+                Some(msg) = rx.recv() => {
+                    app.on_msg(msg).await;
+                    while let Ok(m) = rx.try_recv() {
+                        app.on_msg(m).await;
+                    }
                 }
-                let toast_live = app.toast.as_ref().is_some_and(|(_, t)| t.elapsed() < Duration::from_millis(2700));
-                // Every 6s: the subscription meter alternates 5h / weekly.
-                let meter_flip = app.tick % 120 == 0 && !app.limits.is_empty();
-                if app.animating() || toast_live || meter_flip || app.poll_narrator() {
-                    app.dirty = true;
-                }
-            }
-        }
-        if app.should_quit {
-            break;
-        }
-        if let Some(ext) = app.external.take() {
-            restore_terminal(enhanced, mouse);
-            match ext {
-                External::Login => {
-                    println!("\nRunning `claude auth login` — follow the prompts, then you'll return to blush.\n");
-                    let status = std::process::Command::new(which::which("claude").unwrap_or_else(|_| "claude".into()))
-                        .args(["auth", "login"])
-                        .status();
-                    if let Err(e) = status {
-                        println!("Couldn't run claude: {e}. Install Claude Code: https://claude.com/code");
-                        println!("Press Enter to return…");
-                        let _ = io::stdin().read_line(&mut String::new());
+                _ = ticker.tick() => {
+                    app.tick = app.tick.wrapping_add(1);
+                    if app.tick % 1200 == 0 {
+                        // Once a minute: keep the subscription meter fresh while idle.
+                        app.maybe_refresh_usage();
+                    }
+                    let toast_live = app.toast.as_ref().is_some_and(|(_, t)| t.elapsed() < Duration::from_millis(2700));
+                    // Every 6s: the subscription meter alternates 5h / weekly.
+                    let meter_flip = app.tick % 120 == 0 && !app.limits.is_empty();
+                    if app.animating() || toast_live || meter_flip || app.poll_narrator() {
+                        app.dirty = true;
                     }
                 }
             }
-            let (t, e) = setup_terminal(mouse)?;
-            term = t;
-            enhanced = e;
-            term.clear()?;
-            app.dirty = true;
-            app.after_login().await;
+            if app.should_quit {
+                break;
+            }
+            if let Some(ext) = app.external.take() {
+                restore_terminal(enhanced, mouse);
+                match ext {
+                    External::Login => {
+                        println!("\nRunning `claude auth login` — follow the prompts, then you'll return to blush.\n");
+                        let status = std::process::Command::new(which::which("claude").unwrap_or_else(|_| "claude".into()))
+                            .args(["auth", "login"])
+                            .status();
+                        if let Err(e) = status {
+                            println!("Couldn't run claude: {e}. Install Claude Code: https://claude.com/code");
+                            println!("Press Enter to return…");
+                            let _ = io::stdin().read_line(&mut String::new());
+                        }
+                    }
+                }
+                let (t, e) = setup_terminal(mouse)?;
+                term = t;
+                enhanced = e;
+                term.clear()?;
+                app.dirty = true;
+                app.after_login().await;
+            }
         }
+        Ok(())
     }
+    .await;
 
     if let Some(c) = app.client.take() {
         c.shutdown().await;
@@ -277,5 +299,5 @@ async fn run_tui(
     if let Some(id) = &app.session.id {
         let _ = writeln!(io::stdout(), "Resume this session with: blush --resume {id}");
     }
-    Ok(())
+    result
 }

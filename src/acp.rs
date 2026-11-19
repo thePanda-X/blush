@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -58,15 +58,23 @@ impl std::error::Error for RpcError {}
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, RpcError>>>>>;
 
+/// Where the client delivers notifications, requests, stderr and exit events.
+/// It's called inline by the reader, so a notification is always delivered
+/// before the reply to any request that follows it on the wire.
+pub type EventSink = Arc<dyn Fn(Incoming) + Send + Sync>;
+
 pub struct AcpClient {
     out: mpsc::UnboundedSender<String>,
+    /// Closes the writer (and so the agent's stdin) on shutdown.
+    close_stdin: Arc<Notify>,
     pending: Pending,
     next_id: AtomicU64,
     child: Mutex<Option<Child>>,
 }
 
 impl AcpClient {
-    pub async fn spawn(spec: &LaunchSpec, events: mpsc::UnboundedSender<Incoming>) -> Result<Arc<Self>> {
+    pub async fn spawn(spec: &LaunchSpec, events: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Arc<Self>> {
+        let events: EventSink = Arc::new(events);
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
@@ -94,9 +102,18 @@ impl AcpClient {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
         // Writer
+        let close_stdin = Arc::new(Notify::new());
+        let close = close_stdin.clone();
         tokio::spawn(async move {
             let mut stdin = stdin;
-            while let Some(line) = out_rx.recv().await {
+            loop {
+                let line = tokio::select! {
+                    l = out_rx.recv() => match l {
+                        Some(l) => l,
+                        None => break,
+                    },
+                    _ = close.notified() => break,
+                };
                 if stdin.write_all(line.as_bytes()).await.is_err() {
                     break;
                 }
@@ -113,7 +130,7 @@ impl AcpClient {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = events.send(Incoming::Stderr(line));
+                    events(Incoming::Stderr(line));
                 }
             });
         }
@@ -137,7 +154,7 @@ impl AcpClient {
                         continue;
                     }
                     let Ok(msg) = serde_json::from_str::<Value>(line) else {
-                        let _ = events.send(Incoming::Stderr(format!("[non-json stdout] {line}")));
+                        events(Incoming::Stderr(format!("[non-json stdout] {line}")));
                         continue;
                     };
                     let method = msg.get("method").and_then(|m| m.as_str()).map(str::to_owned);
@@ -145,11 +162,11 @@ impl AcpClient {
                     match (method, id) {
                         (Some(method), Some(id)) => {
                             let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = events.send(Incoming::Request { id, method, params });
+                            events(Incoming::Request { id, method, params });
                         }
                         (Some(method), None) => {
                             let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = events.send(Incoming::Notification { method, params });
+                            events(Incoming::Notification { method, params });
                         }
                         (None, Some(id)) => {
                             let Some(n) = id.as_u64() else { continue };
@@ -188,6 +205,7 @@ impl AcpClient {
 
         let client = Arc::new(AcpClient {
             out: out_tx,
+            close_stdin,
             pending,
             next_id: AtomicU64::new(1),
             child: Mutex::new(Some(child)),
@@ -202,7 +220,7 @@ impl AcpClient {
                     let mut guard = client.child.lock().await;
                     let Some(child) = guard.as_mut() else { return };
                     if let Ok(Some(status)) = child.try_wait() {
-                        let _ = events.send(Incoming::Exited(status.code()));
+                        events(Incoming::Exited(status.code()));
                         *guard = None;
                         return;
                     }
@@ -246,7 +264,8 @@ impl AcpClient {
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             // Closing stdin asks the adapter to exit gracefully; then make sure.
-            drop(child.stdin.take());
+            // (`notify_one` stores a permit, so this works even mid-write.)
+            self.close_stdin.notify_one();
             let waited =
                 tokio::time::timeout(std::time::Duration::from_millis(800), child.wait()).await;
             if waited.is_err() {

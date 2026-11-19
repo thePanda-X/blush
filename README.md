@@ -29,7 +29,7 @@ Grok Build's look and feel, with Claude Code doing the work underneath, connecte
 
   I added div to calc.py …                                                  7:53 PM
 
-⁙ Responding… 4s                                                  4s ⇣36 [stop]
+⁙ Responding… 4s                                                     ⇣36 [stop]
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ ❯                                                                            │
 ╰─────────────────────────────────────── Claude Opus 5.5 (high) · always-approve ╯
@@ -128,8 +128,10 @@ That means `blush -p "…" > answer.md` saves only the answer.
 | `Enter` | Send. If Claude is still responding, the prompt is queued. |
 | `Shift+Enter` · `Alt+Enter` · `Ctrl+J` · `\` + `Enter` | New line |
 | `Shift+Tab` | Cycle permission mode: always-approve → ask → accept-edits → plan → auto |
-| `Ctrl+C` | First press stops the response, the next clears the prompt, and pressing twice on an empty prompt quits |
-| `Tab` / `↑` on an empty prompt | Move focus to the scrollback |
+| `Ctrl+C` | First press stops the response, the next clears the prompt, and pressing twice on an empty prompt quits. If you stop a turn with prompts queued, they're held: `Enter` sends them, `Ctrl+C` drops them |
+| `Ctrl+D` on an empty prompt | Quit (press twice while Claude is working) |
+| `↑` / `↓` in the prompt | Move between lines, then through prompt history |
+| `Tab` on an empty prompt | Move focus to the scrollback |
 | `↑` `↓` · `←` `→` · `Enter` · `y` | In the scrollback: select an entry, fold or unfold it, open it in the viewer, copy it |
 | `o` / `r` | In the scrollback: open the selected tool's file, or reveal it in Explorer / Finder |
 | `Shift+←` / `Shift+→` | Jump between turns |
@@ -257,13 +259,15 @@ session or history.
 `/narrator`, or a click on the `⏸ narrator off` toggle in the footer, turns on spoken summaries.
 After each turn, blush reads the opening of Claude's final message aloud with your system voice:
 System.Speech on Windows, `say` on macOS, and `spd-say` or `espeak-ng` on Linux. The toggle shows
-`⏹ narrating` while it speaks, and clicking it stops the speech. Sending a new prompt also stops it.
+`⏹ narrating` while it speaks, and clicking it stops the speech. `/narrator` and `Alt+N` stop it and turn
+the narrator off. Sending a new prompt also stops it.
 
 ### Quick Peek
 
 Select a tool entry in the scrollback (click it, or `Tab` and then `↑`/`↓`). The footer shows the
 file's name, type, size, and how long ago it was modified. Press `o` to open the file in its
-default app, or `r` to reveal it in Explorer / Finder / your file manager.
+default app, or `r` to reveal it in Explorer / Finder / your file manager. Scripts and executables
+(`.js`, `.bat`, `.ps1`, `.exe`, …) are always revealed, never run.
 
 ### `/after`
 

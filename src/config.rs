@@ -12,6 +12,10 @@ pub struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub features: FeaturesConfig,
+    /// Set when the file existed but couldn't be parsed (shown in the TUI,
+    /// where a plain stderr line would vanish behind the alternate screen).
+    #[serde(skip)]
+    pub load_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,7 +112,7 @@ impl Default for AgentConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default() }
+        Config { ui: UiConfig::default(), agent: AgentConfig::default(), features: FeaturesConfig::default(), load_warning: None }
     }
 }
 
@@ -130,8 +134,13 @@ impl Config {
             Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("warning: ignoring invalid {}: {e}", path.display());
-                    Config::default()
+                    let msg = format!(
+                        "Ignoring {} (using defaults until it's fixed; blush won't overwrite it): {}",
+                        path.display(),
+                        e.message()
+                    );
+                    eprintln!("warning: {msg}");
+                    Config { load_warning: Some(msg), ..Config::default() }
                 }
             },
             Err(_) => {
@@ -140,6 +149,25 @@ impl Config {
                 c
             }
         }
+    }
+
+    /// Apply `f` to the config *as stored on disk* and write it back.
+    ///
+    /// The in-memory config carries one-off CLI overrides (`--theme`, `--mode`,
+    /// `--model`, `--no-mouse`), so saving it wholesale would make them sticky.
+    /// If the file exists but doesn't parse, it's left alone rather than being
+    /// clobbered with defaults.
+    pub fn persist(f: impl FnOnce(&mut Config)) {
+        let path = config_path();
+        let mut disk = match std::fs::read_to_string(&path) {
+            Ok(s) => match toml::from_str::<Config>(&s) {
+                Ok(c) => c,
+                Err(_) => return,
+            },
+            Err(_) => Config::default(),
+        };
+        f(&mut disk);
+        let _ = disk.save();
     }
 
     pub fn save(&self) -> Result<()> {

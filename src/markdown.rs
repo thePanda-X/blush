@@ -103,11 +103,15 @@ struct Renderer<'t> {
     spans: Vec<Span<'static>>,
     style_stack: Vec<Style>,
     lists: Vec<ListKind>,
+    /// Hanging indent of each open list: the width of its current marker, so
+    /// wrapped lines line up under the item's text (`1. ` is 3 wide, `• ` 2).
+    list_widths: Vec<usize>,
     item_prefix: Option<Vec<Span<'static>>>,
     quote_depth: usize,
     code: Option<(String, String)>,
     heading: Option<HeadingLevel>,
-    link: Option<String>,
+    /// Open link: its URL and where its text starts in `spans`.
+    link: Option<(String, usize)>,
     table: Option<Table>,
     pending_blank: bool,
 }
@@ -135,7 +139,7 @@ impl<'t> Renderer<'t> {
         for _ in 0..self.quote_depth {
             p.push(Span::styled("┃ ", Style::default().fg(self.theme.md.quote_bar.unwrap_or(self.theme.gray_dim))));
         }
-        let list_indent = self.lists.len().saturating_sub(1) * 2 + if self.lists.is_empty() { 0 } else { 2 };
+        let list_indent: usize = self.list_widths.iter().sum();
         if list_indent > 0 {
             p.push(Span::raw(" ".repeat(list_indent)));
         }
@@ -257,6 +261,8 @@ impl<'t> Renderer<'t> {
                 Tag::BlockQuote(_) => {
                     self.flush_paragraph();
                     self.blank();
+                    // The gap before the quote belongs outside it, not on a `┃` row.
+                    self.emit_blank_if_pending();
                     self.quote_depth += 1;
                     self.push_style(|s| s.fg(self.theme.md.quote_text.unwrap_or(self.theme.gray_bright)).add_modifier(Modifier::ITALIC));
                 }
@@ -278,6 +284,7 @@ impl<'t> Renderer<'t> {
                         Some(n) => ListKind::Ordered(n),
                         None => ListKind::Bullet,
                     });
+                    self.list_widths.push(2);
                 }
                 Tag::Item => {
                     self.flush_paragraph();
@@ -290,13 +297,16 @@ impl<'t> Renderer<'t> {
                         }
                         _ => if depth > 1 { "◦ ".to_string() } else { "• ".to_string() },
                     };
+                    if let Some(w) = self.list_widths.last_mut() {
+                        *w = width(&marker);
+                    }
                     self.item_prefix = Some(vec![Span::styled(marker, Style::default().fg(self.theme.md.bullet.unwrap_or(self.theme.gray)))]);
                 }
                 Tag::Emphasis => self.push_style(|s| s.add_modifier(Modifier::ITALIC)),
                 Tag::Strong => self.push_style(|s| s.add_modifier(Modifier::BOLD).fg(self.theme.md.strong.unwrap_or(self.theme.text))),
                 Tag::Strikethrough => self.push_style(|s| s.add_modifier(Modifier::CROSSED_OUT)),
                 Tag::Link { dest_url, .. } => {
-                    self.link = Some(dest_url.to_string());
+                    self.link = Some((dest_url.to_string(), self.spans.len()));
                     self.push_style(|s| s.fg(self.theme.link).add_modifier(Modifier::UNDERLINED));
                 }
                 Tag::Image { dest_url, .. } => {
@@ -342,6 +352,7 @@ impl<'t> Renderer<'t> {
                 TagEnd::List(_) => {
                     self.flush_paragraph();
                     self.lists.pop();
+                    self.list_widths.pop();
                     if self.lists.is_empty() {
                         self.blank();
                     }
@@ -352,7 +363,21 @@ impl<'t> Renderer<'t> {
                 }
                 TagEnd::Link => {
                     self.style_stack.pop();
-                    self.link = None;
+                    // Show where a link goes unless its text already says so.
+                    if let Some((url, start)) = self.link.take() {
+                        let text: String = self.spans[start.min(self.spans.len())..].iter().map(|s| s.content.as_ref()).collect();
+                        let bare = |u: &str| {
+                            u.trim_start_matches("mailto:")
+                                .trim_start_matches("https://")
+                                .trim_start_matches("http://")
+                                .trim_end_matches('/')
+                                .to_string()
+                        };
+                        if !url.is_empty() && !url.starts_with('#') && bare(&url) != bare(text.trim()) {
+                            let shown = if width(&url) > 60 { crate::text::truncate(&url, 60) } else { url };
+                            self.spans.push(Span::styled(format!(" ({shown})"), Style::default().fg(self.theme.gray_dim)));
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -506,6 +531,7 @@ pub fn render(md: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         spans: Vec::new(),
         style_stack: vec![Style::default().fg(theme.md_text)],
         lists: Vec::new(),
+        list_widths: Vec::new(),
         item_prefix: None,
         quote_depth: 0,
         code: None,
@@ -578,5 +604,22 @@ mod tests {
         let out = render("```rust\nfn main() {}\n```", 30, &t);
         assert_eq!(out.len(), 1);
         assert!(plain(&out)[0].contains("fn main() {}"));
+    }
+
+    #[test]
+    fn lists_quotes_and_links_line_up() {
+        let th = Theme::blush();
+        let md = "Intro.\n\n1. first item that is long enough to wrap onto a second line here\n2. second\n\n- bullet\n  - nested\n\n> quoted\n\nSee [the docs](https://example.com/x) or <https://example.com>.\n";
+        let text: Vec<String> = render(md, 40, &th)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        println!("{}", text.join("\n"));
+        let item = text.iter().position(|l| l.starts_with("1. first")).expect("numbered item at column 0");
+        assert!(text[item + 1].starts_with("   ") && !text[item + 1].starts_with("    "), "hanging indent: {:?}", text[item + 1]);
+        let quote = text.iter().position(|l| l.contains("quoted")).unwrap();
+        assert!(!text[quote - 1].contains('┃'), "blank before quote is outside it");
+        assert!(text.iter().any(|l| l.contains("the docs (https://example.com/x)")));
+        assert!(!text.iter().any(|l| l.contains("(https://example.com)")), "autolinks aren't repeated");
     }
 }

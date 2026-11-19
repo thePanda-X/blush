@@ -70,8 +70,31 @@ fn short_age(s: u64) -> String {
     }
 }
 
-/// Open with the system's default app.
-pub fn open(p: &Path) -> std::io::Result<()> {
+/// Files whose default "open" action is to run them (Windows Script Host,
+/// batch files, installers, binaries). These are revealed instead.
+fn runs_when_opened(p: &Path) -> bool {
+    const RUNNABLE: &[&str] = &[
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msc", "scr",
+        "lnk", "hta", "cpl", "jar", "reg", "sh", "command", "app", "url",
+    ];
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| RUNNABLE.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+pub enum Opened {
+    Opened,
+    /// Executable or script: shown in the file manager rather than run.
+    Revealed,
+}
+
+/// Open with the system's default app, unless that would execute the file.
+pub fn open(p: &Path) -> std::io::Result<Opened> {
+    if runs_when_opened(p) {
+        return reveal(p).map(|_| Opened::Revealed);
+    }
+    open_default(p).map(|_| Opened::Opened)
+}
+
+fn open_default(p: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut c = {
         let mut c = Command::new("open");
@@ -106,7 +129,9 @@ pub fn reveal(p: &Path) -> std::io::Result<()> {
         use std::os::windows::process::CommandExt;
         let mut c = Command::new("explorer.exe");
         // explorer needs `/select,<path>` as one raw argument.
-        c.raw_arg(format!("/select,\"{}\"", p.display()));
+        // It also only understands backslashes.
+        let path = p.display().to_string().replace('/', "\\");
+        c.raw_arg(format!("/select,\"{path}\""));
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -119,7 +144,12 @@ pub fn reveal(p: &Path) -> std::io::Result<()> {
 }
 
 fn detach(c: &mut Command) -> std::io::Result<()> {
-    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ())
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    // Reap it so `open` / `xdg-open` don't linger as zombies on Unix.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[cfg(test)]

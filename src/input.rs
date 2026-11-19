@@ -58,13 +58,13 @@ impl Input {
         let s = s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ");
         self.text.insert_str(self.cursor, &s);
         self.cursor += s.len();
-        self.goal_col = None;
+        self.edited();
     }
 
     pub fn insert_char(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
-        self.goal_col = None;
+        self.edited();
     }
 
     fn prev_boundary(&self, from: usize) -> usize {
@@ -86,7 +86,7 @@ impl Input {
         let p = self.prev_boundary(self.cursor);
         self.text.replace_range(p..self.cursor, "");
         self.cursor = p;
-        self.goal_col = None;
+        self.edited();
     }
 
     pub fn delete(&mut self) {
@@ -95,7 +95,7 @@ impl Input {
         }
         let n = self.next_boundary(self.cursor);
         self.text.replace_range(self.cursor..n, "");
-        self.goal_col = None;
+        self.edited();
     }
 
     pub fn left(&mut self) {
@@ -148,6 +148,7 @@ impl Input {
         let end = self.cursor;
         self.word_left();
         self.text.replace_range(self.cursor..end, "");
+        self.edited();
     }
 
     pub fn line_start(&self) -> usize {
@@ -177,6 +178,7 @@ impl Input {
         }
         self.text.replace_range(s..self.cursor, "");
         self.cursor = s;
+        self.edited();
     }
 
     pub fn kill_to_end(&mut self) {
@@ -186,6 +188,7 @@ impl Input {
             return;
         }
         self.text.replace_range(self.cursor..e, "");
+        self.edited();
     }
 
     /// Soft-wrap layout: each visual row is (start_byte, end_byte).
@@ -308,7 +311,9 @@ impl Input {
     /// The `@token` or `/token` being typed at the cursor, with its byte start.
     pub fn current_token(&self) -> Option<(usize, &str)> {
         let before = &self.text[..self.cursor];
-        let start = before.rfind(|c: char| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+        // Whitespace can be multi-byte (NBSP, the full-width IME space): step
+        // past the whole character, not one byte.
+        let start = before.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
         let tok = &self.text[start..self.cursor];
         if tok.is_empty() { None } else { Some((start, tok)) }
     }
@@ -316,6 +321,13 @@ impl Input {
     pub fn replace_range(&mut self, start: usize, end: usize, with: &str) {
         self.text.replace_range(start..end, with);
         self.cursor = start + with.len();
+        self.edited();
+    }
+
+    /// The text changed by hand: it's no longer a history entry, so ↑/↓ move
+    /// within it again instead of replacing it with the neighbouring entry.
+    fn edited(&mut self) {
+        self.history_pos = None;
         self.goal_col = None;
     }
 }
@@ -346,5 +358,25 @@ mod tests {
         assert_eq!(i.cursor_pos(10), (1, 2));
         assert!(i.up(10));
         assert_eq!(i.cursor, 1);
+    }
+
+    #[test]
+    fn editing_a_recalled_entry_leaves_history() {
+        let mut i = Input::default();
+        i.load_history(vec!["first".into(), "second\nline".into()]);
+        assert!(i.history_prev());
+        assert!(i.in_history());
+        i.insert_char('!');
+        assert!(!i.in_history());
+        assert_eq!(i.text, "second\nline!");
+    }
+
+    #[test]
+    fn tokens_after_multibyte_spaces() {
+        let mut i = Input::default();
+        i.insert_str("foo\u{3000}@sr");
+        assert_eq!(i.current_token(), Some((6, "@sr")));
+        i.insert_str("\u{a0}");
+        assert_eq!(i.current_token(), None);
     }
 }

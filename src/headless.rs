@@ -4,6 +4,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -14,15 +15,51 @@ use crate::config::Config;
 use crate::launcher;
 use crate::model::{content_text, s};
 
+/// Writes the answer to stdout. Once stdout is closed (`blush -p … | head -1`)
+/// it stops writing quietly instead of panicking like `print!` would.
+struct Out {
+    out: std::io::Stdout,
+    open: bool,
+    ended_with_newline: bool,
+}
+
+impl Out {
+    fn emit(&mut self, t: &str) {
+        if !self.open || t.is_empty() {
+            return;
+        }
+        if self.out.write_all(t.as_bytes()).and_then(|_| self.out.flush()).is_err() {
+            self.open = false;
+        } else {
+            self.ended_with_newline = t.ends_with('\n');
+        }
+    }
+}
+
+/// The text of an `agent_message_chunk` update, if `params` is one.
+fn message_chunk(params: &Value) -> Option<String> {
+    let u = params.get("update")?;
+    if s(u, "sessionUpdate") != "agent_message_chunk" {
+        return None;
+    }
+    u.get("content").and_then(content_text)
+}
+
 pub async fn run(config: Config, cwd: PathBuf, prompt: String) -> Result<i32> {
     if launcher::needs_install(&config) {
         launcher::install_adapter(|m| eprintln!("{m}")).await?;
     }
     let spec = launcher::launch_spec(&config, &cwd)?;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = AcpClient::spawn(&spec, tx).await?;
+    let client = AcpClient::spawn(&spec, move |m| {
+        let _ = tx.send(m);
+    })
+    .await?;
 
-    client.request("initialize", acp::initialize_params()).await.map_err(|e| anyhow!("initialize: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(90), client.request("initialize", acp::initialize_params()))
+        .await
+        .map_err(|_| anyhow!("timed out waiting for the agent to initialize"))?
+        .map_err(|e| anyhow!("initialize: {e}"))?;
     let sess = client
         .request("session/new", json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}))
         .await
@@ -31,7 +68,7 @@ pub async fn run(config: Config, cwd: PathBuf, prompt: String) -> Result<i32> {
         eprintln!("{}", serde_json::to_string_pretty(&sess).unwrap_or_default());
     }
     let sid = s(&sess, "sessionId");
-    let mode = config.agent.default_mode.clone();
+    let mode = config.agent.default_mode.trim().to_string();
     let has_mode = sess
         .get("modes")
         .and_then(|m| m.get("availableModes"))
@@ -39,11 +76,29 @@ pub async fn run(config: Config, cwd: PathBuf, prompt: String) -> Result<i32> {
         .is_some_and(|a| a.iter().any(|m| s(m, "id") == mode));
     if has_mode {
         let _ = client.request("session/set_mode", json!({"sessionId": sid, "modeId": mode})).await;
+    } else if !mode.is_empty() {
+        eprintln!("warning: mode `{mode}` isn't offered by the agent; using its default");
     }
-    if !config.agent.model.is_empty() {
-        let _ = client
-            .request("session/set_config_option", json!({"sessionId": sid, "configId": "model", "value": config.agent.model}))
-            .await;
+    let has_option = |id: &str| {
+        sess.get("configOptions").and_then(|o| o.as_array()).is_some_and(|a| a.iter().any(|o| s(o, "id") == id))
+    };
+    let model = config.agent.model.trim();
+    if !model.is_empty() {
+        let r = if has_option("model") {
+            client.request("session/set_config_option", json!({"sessionId": sid, "configId": "model", "value": model})).await
+        } else {
+            client.request("session/set_model", json!({"sessionId": sid, "modelId": model})).await
+        };
+        if let Err(e) = r {
+            eprintln!("warning: couldn't select model `{model}`: {e}");
+        }
+    }
+    let effort = config.agent.effort.trim();
+    if !effort.is_empty() && has_option("effort") {
+        let r = client.request("session/set_config_option", json!({"sessionId": sid, "configId": "effort", "value": effort})).await;
+        if let Err(e) = r {
+            eprintln!("warning: couldn't set effort `{effort}`: {e}");
+        }
     }
 
     let mut blocks = vec![acp::text_block(&prompt)];
@@ -58,29 +113,24 @@ pub async fn run(config: Config, cwd: PathBuf, prompt: String) -> Result<i32> {
         c2.request("session/prompt", json!({"sessionId": sid2, "prompt": blocks})).await
     });
 
-    let mut out = std::io::stdout();
-    let mut ended_with_newline = true;
+    let mut out = Out { out: std::io::stdout(), open: true, ended_with_newline: true };
     let result = loop {
         tokio::select! {
-            r = &mut turn => break r,
+            // Drain updates before looking at the reply: the reply to
+            // `session/prompt` can be ready while the last chunks are queued.
+            biased;
             Some(m) = rx.recv() => match m {
                 Incoming::Notification { method, params } if method == "session/update" => {
-                    let u = params.get("update").cloned().unwrap_or(Value::Null);
-                    match s(&u, "sessionUpdate").as_str() {
-                        "agent_message_chunk" => {
-                            if let Some(t) = u.get("content").and_then(content_text) {
-                                print!("{t}");
-                                ended_with_newline = t.ends_with('\n');
-                                let _ = out.flush();
-                            }
-                        }
-                        "tool_call" => {
+                    if let Some(t) = message_chunk(&params) {
+                        out.emit(&t);
+                    } else {
+                        let u = params.get("update").cloned().unwrap_or(Value::Null);
+                        if s(&u, "sessionUpdate") == "tool_call" {
                             let title = s(&u, "title");
                             if !title.is_empty() {
                                 eprintln!("\x1b[2m◆ {}\x1b[0m", title.lines().next().unwrap_or(""));
                             }
                         }
-                        _ => {}
                     }
                 }
                 Incoming::Request { id, method, params } => {
@@ -106,11 +156,21 @@ pub async fn run(config: Config, cwd: PathBuf, prompt: String) -> Result<i32> {
                     break Ok(Err(acp::RpcError { code: -32000, message: "agent exited".into(), data: None }));
                 }
                 _ => {}
-            }
+            },
+            r = &mut turn => break r,
         }
     };
-    if !ended_with_newline {
-        println!();
+    // Anything still queued arrived before the reply; print it too.
+    while let Ok(m) = rx.try_recv() {
+        if let Incoming::Notification { method, params } = m
+            && method == "session/update"
+            && let Some(t) = message_chunk(&params)
+        {
+            out.emit(&t);
+        }
+    }
+    if !out.ended_with_newline {
+        out.emit("\n");
     }
     client.shutdown().await;
     match result {

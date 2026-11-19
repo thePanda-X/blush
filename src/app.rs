@@ -31,8 +31,10 @@ pub enum AppMsg {
     SessionReady { result: Value, kind: SessionKind },
     SessionFailed(String),
     PromptDone(Result<Value, RpcError>),
-    ModeSet(String, Result<Value, RpcError>),
-    ConfigSet(Result<Value, RpcError>),
+    /// (requested mode, mode to restore on failure, result)
+    ModeSet(String, String, Result<Value, RpcError>),
+    /// (option id and value to restore on failure, result)
+    ConfigSet(Option<(String, String)>, Result<Value, RpcError>),
     Sessions(Result<Value, RpcError>),
     /// Legacy `session/set_model` change made by a per-turn override.
     LegacyModel(String),
@@ -163,6 +165,9 @@ pub struct PermissionCard {
     /// (optionId, name, kind)
     pub options: Vec<(String, String, String)>,
     pub sel: usize,
+    /// When the card reached the front of the queue. Keystrokes in the first
+    /// moments are ignored so typing in progress can't approve or reject it.
+    pub shown: Instant,
 }
 
 #[derive(Clone)]
@@ -210,6 +215,12 @@ pub struct LayoutInfo {
     pub total_lines: usize,
     pub view_height: usize,
     pub card_area: Option<Rect>,
+    /// Viewer overlay: the largest useful scroll offset and the page height,
+    /// both in rendered (wrapped) rows.
+    pub viewer_max: usize,
+    pub viewer_page: usize,
+    /// Shortcuts overlay: the largest useful scroll offset.
+    pub shortcuts_max: usize,
 }
 
 pub enum External {
@@ -274,6 +285,10 @@ pub struct App {
 
     pub tick: u64,
     pub quit_armed: Option<Instant>,
+    /// Scroll offset of the shortcuts overlay (it's taller than most terminals).
+    pub shortcuts_scroll: usize,
+    /// A stopped turn left prompts queued: hold them until the user says so.
+    pub queue_paused: bool,
     pub esc_armed: Option<Instant>,
     pub toast: Option<(String, Instant)>,
     pub should_quit: bool,
@@ -286,6 +301,8 @@ pub struct App {
     pub force_redraw: bool,
     pub continue_latest: bool,
     pub pick_session: bool,
+    /// An adapter launch is in flight; a second one would orphan the first.
+    starting: bool,
     pub pending_prompt: Option<String>,
     /// `session/update`s that arrived for a not-yet-known session while a
     /// `session/new` was in flight; replayed once its id is known.
@@ -333,6 +350,9 @@ impl App {
         transcript.show_thinking = config.ui.show_thinking;
         transcript.expand_thinking = config.ui.expand_thinking;
         transcript.push(Block::Welcome);
+        if let Some(w) = &config.load_warning {
+            transcript.notice(Level::Warn, w.clone());
+        }
         let mut input = Input::default();
         input.load_history(load_history());
         App {
@@ -378,6 +398,8 @@ impl App {
             follow: true,
             tick: 0,
             quit_armed: None,
+            shortcuts_scroll: 0,
+            queue_paused: false,
             esc_armed: None,
             toast: None,
             should_quit: false,
@@ -390,6 +412,7 @@ impl App {
             force_redraw: false,
             continue_latest: false,
             pick_session: false,
+            starting: false,
             pending_prompt: None,
             early_updates: Vec::new(),
             config,
@@ -420,6 +443,11 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn start_agent(&mut self) {
+        if self.starting {
+            // Already launching: the pending `startup` kind is picked up on connect.
+            return;
+        }
+        self.starting = true;
         self.conn = Conn::Starting("Starting Claude Code…".into());
         let tx = self.tx.clone();
         let config = self.config.clone();
@@ -443,24 +471,20 @@ impl App {
                     return;
                 }
             };
-            let (itx, mut irx) = mpsc::unbounded_channel();
-            let client = match AcpClient::spawn(&spec, itx).await {
+            // Agent events go straight onto the app channel, so they always
+            // arrive before the `PromptDone` for the turn that produced them.
+            let etx = tx.clone();
+            let client = match AcpClient::spawn(&spec, move |m| {
+                let _ = etx.send(AppMsg::Acp(m));
+            })
+            .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(AppMsg::StartFailed(e.to_string()));
                     return;
                 }
             };
-            {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    while let Some(m) = irx.recv().await {
-                        if tx.send(AppMsg::Acp(m)).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
             let _ = tx.send(AppMsg::Status("Connecting…".into()));
             match tokio::time::timeout(Duration::from_secs(90), client.request("initialize", acp::initialize_params())).await {
                 Ok(Ok(init)) => {
@@ -474,6 +498,14 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Send the startup prompt (if any) and prompts typed while connecting.
+    async fn flush_pending(&mut self) {
+        if let Some(p) = self.pending_prompt.take() {
+            Box::pin(self.submit(p)).await;
+        }
+        self.pump_queue();
     }
 
     pub async fn restart_agent(&mut self) {
@@ -559,10 +591,10 @@ impl App {
         }
         let tx = self.tx.clone();
         let mode = mode.to_string();
-        self.session.mode = mode.clone();
+        let prev = std::mem::replace(&mut self.session.mode, mode.clone());
         tokio::spawn(async move {
             let r = client.request("session/set_mode", json!({"sessionId": sid, "modeId": mode})).await;
-            let _ = tx.send(AppMsg::ModeSet(mode, r));
+            let _ = tx.send(AppMsg::ModeSet(mode, prev, r));
         });
     }
 
@@ -572,20 +604,21 @@ impl App {
         if id == "__model" {
             // legacy session/set_model
             let value = value.to_string();
-            self.session.model = value.clone();
+            let prev = std::mem::replace(&mut self.session.model, value.clone());
             tokio::spawn(async move {
                 let r = client.request("session/set_model", json!({"sessionId": sid, "modelId": value})).await;
-                let _ = tx.send(AppMsg::ConfigSet(r.map(|_| Value::Null)));
+                let _ = tx.send(AppMsg::ConfigSet(Some(("__model".into(), prev)), r.map(|_| Value::Null)));
             });
             return;
         }
+        let mut undo = None;
         if let Some(o) = self.session.config.iter_mut().find(|o| o.id == id) {
-            o.current = value.to_string();
+            undo = Some((id.to_string(), std::mem::replace(&mut o.current, value.to_string())));
         }
         let params = json!({"sessionId": sid, "configId": id, "value": value});
         tokio::spawn(async move {
             let r = client.request("session/set_config_option", params).await;
-            let _ = tx.send(AppMsg::ConfigSet(r));
+            let _ = tx.send(AppMsg::ConfigSet(undo, r));
         });
     }
 
@@ -625,10 +658,12 @@ impl App {
                 self.conn = Conn::Starting(s);
             }
             AppMsg::StartFailed(e) => {
+                self.starting = false;
                 self.conn = Conn::Failed(e.clone());
                 self.transcript.notice(Level::Error, format!("Couldn't start Claude Code: {e}"));
             }
             AppMsg::Connected(client, init) => {
+                self.starting = false;
                 self.agent_caps = init.get("agentCapabilities").cloned().unwrap_or(Value::Null);
                 if let Some(info) = init.get("agentInfo") {
                     let t = s(info, "title");
@@ -690,11 +725,7 @@ impl App {
                 }
                 self.continue_latest = false;
                 self.pick_session = false;
-                if let Some(p) = self.pending_prompt.take() {
-                    Box::pin(self.submit(p)).await;
-                }
-                // Flush prompts typed while starting up.
-                self.pump_queue();
+                self.flush_pending().await;
                 self.maybe_refresh_usage();
             }
             AppMsg::SessionFailed(e) => {
@@ -703,18 +734,32 @@ impl App {
                 self.transcript.notice(Level::Error, format!("Couldn't open session: {e}"));
             }
             AppMsg::PromptDone(res) => self.on_prompt_done(res),
-            AppMsg::ModeSet(mode, res) => {
+            AppMsg::ModeSet(mode, prev, res) => {
                 if let Err(e) = res {
+                    if self.session.mode == mode {
+                        self.session.mode = prev;
+                    }
                     self.transcript.notice(Level::Error, format!("Couldn't switch to {mode}: {e}"));
                 }
             }
-            AppMsg::ConfigSet(res) => match res {
+            AppMsg::ConfigSet(undo, res) => match res {
                 Ok(v) => {
                     if let Some(c) = v.get("configOptions") {
                         self.session.apply_config(c);
                     }
                 }
-                Err(e) => self.transcript.notice(Level::Error, format!("Couldn't change setting: {e}")),
+                Err(e) => {
+                    match undo {
+                        Some((id, prev)) if id == "__model" => self.session.model = prev,
+                        Some((id, prev)) => {
+                            if let Some(o) = self.session.config.iter_mut().find(|o| o.id == id) {
+                                o.current = prev;
+                            }
+                        }
+                        None => {}
+                    }
+                    self.transcript.notice(Level::Error, format!("Couldn't change setting: {e}"));
+                }
             },
             AppMsg::Sessions(res) => match res {
                 Ok(v) if self.continue_latest => {
@@ -727,14 +772,22 @@ impl App {
                         .map(|x| s(x, "sessionId"));
                     match first {
                         Some(id) => self.resume(id),
-                        None => self.toast("No previous session to continue"),
+                        None => {
+                            self.toast("No previous session to continue");
+                            self.flush_pending().await;
+                        }
                     }
                 }
                 Ok(v) => {
                     self.pick_session = false;
                     self.open_resume_picker(&v)
                 }
-                Err(e) => self.transcript.notice(Level::Error, format!("Couldn't list sessions: {e}")),
+                Err(e) => {
+                    self.continue_latest = false;
+                    self.pick_session = false;
+                    self.transcript.notice(Level::Error, format!("Couldn't list sessions: {e}"));
+                    self.flush_pending().await;
+                }
             },
             AppMsg::LegacyModel(m) => self.session.model = m,
             AppMsg::UsageProbe(sid) => self.usage_probe = Some((sid, String::new())),
@@ -902,6 +955,14 @@ impl App {
             ring_bell();
         }
         self.turns_done += 1;
+        if cancelled && !self.queue.is_empty() {
+            self.queue_paused = true;
+            let n = self.queue.len();
+            self.toast(format!(
+                "Stopped · {n} queued prompt{} on hold: Enter sends, Ctrl+C drops",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
         if self.config.features.narrator && !cancelled {
             self.narrate_last_turn();
         }
@@ -964,10 +1025,24 @@ impl App {
         });
     }
 
+    /// Lock the Time Machine without blocking the UI: a snapshot runs git in
+    /// the background while holding the lock, which can take a while.
+    fn timeline_try_lock_on<'a>(&mut self, tl: &'a std::sync::Mutex<Timeline>) -> Option<std::sync::MutexGuard<'a, Timeline>> {
+        match tl.try_lock() {
+            Ok(t) => Some(t),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.toast("Time Machine is saving a snapshot, try again in a moment");
+                None
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        }
+    }
+
     fn timeline_step(&mut self, delta: isize) {
-        let (cur, len, avail) = match self.timeline.lock() {
-            Ok(t) => (t.cur, t.snaps.len(), t.available()),
-            Err(_) => return,
+        let tl = self.timeline.clone();
+        let (cur, len, avail) = match self.timeline_try_lock_on(&tl) {
+            Some(t) => (t.cur, t.snaps.len(), t.available()),
+            None => return,
         };
         if len == 0 {
             self.toast(if avail || !self.config.features.timeline { "No snapshots yet" } else { "Time Machine needs a git repository" });
@@ -982,7 +1057,8 @@ impl App {
     }
 
     fn open_timeline(&mut self) {
-        let Ok(t) = self.timeline.lock() else { return };
+        let tl = self.timeline.clone();
+        let Some(t) = self.timeline_try_lock_on(&tl) else { return };
         if t.snaps.is_empty() {
             drop(t);
             self.toast("No snapshots yet — they're taken after each turn that changes files");
@@ -1008,25 +1084,34 @@ impl App {
 
     fn preview_timeline(&mut self, idx: usize) {
         let cwd = self.cwd.clone();
-        let r = self.timeline.lock().map_err(|_| anyhow::anyhow!("timeline lock poisoned")).and_then(|mut t| {
+        let tl = self.timeline.clone();
+        let Some(mut t) = self.timeline_try_lock_on(&tl) else { return };
+        let r = (|| -> anyhow::Result<_> {
             let stat = t.diff_stat(&cwd, idx)?;
             let diff = t.diff(&cwd, idx)?;
             Ok((t.snaps[idx].label.clone(), format!("{stat}\n{diff}")))
-        });
+        })();
+        drop(t);
         match r {
             Ok((label, text)) => self.overlay = Overlay::Viewer { title: format!("Snapshot · {label}"), text, scroll: 0 },
             Err(e) => self.toast(format!("Couldn't diff: {e}")),
         }
     }
 
-    pub fn toggle_narrator(&mut self) {
+    /// `/narrator` and Alt+N: turn the feature on or off (stopping any speech).
+    /// The footer button calls this with `click_to_stop`: while speaking, a
+    /// click only silences the current summary.
+    pub fn toggle_narrator(&mut self, click_to_stop: bool) {
         if self.narrator.speaking() {
             self.narrator.stop();
             self.narrating = false;
-            return;
+            if click_to_stop {
+                return;
+            }
         }
         self.config.features.narrator = !self.config.features.narrator;
-        let _ = self.config.save();
+        let on = self.config.features.narrator;
+        Config::persist(|c| c.features.narrator = on);
         if !self.config.features.narrator {
             self.narrator.stop();
         }
@@ -1183,11 +1268,16 @@ impl App {
                 if title.is_empty() {
                     title = "Permission requested".into();
                 }
-                self.permissions.push_back(PermissionCard { id, title, detail, options, sel: 0 });
+                self.permissions.push_back(PermissionCard { id, title, detail, options, sel: 0, shown: Instant::now() });
                 ring_bell();
             }
             "elicitation/create" => {
                 if let Some(card) = build_question(id.clone(), &params) {
+                    // Only one question card shows at a time; never leave the
+                    // agent waiting on one that got replaced.
+                    if self.question.is_some() {
+                        self.answer_question("cancel");
+                    }
                     self.question = Some(card);
                     ring_bell();
                 } else {
@@ -1232,6 +1322,9 @@ impl App {
 
     fn answer_permission(&mut self, choice: Option<usize>) {
         let Some(card) = self.permissions.pop_front() else { return };
+        if let Some(next) = self.permissions.front_mut() {
+            next.shown = Instant::now();
+        }
         let Some(client) = self.client.clone() else { return };
         let outcome = match choice.and_then(|i| card.options.get(i)) {
             Some((oid, _, _)) => json!({"outcome": {"outcome": "selected", "optionId": oid}}),
@@ -1275,6 +1368,10 @@ impl App {
     pub async fn submit(&mut self, raw: String) {
         let text = raw.trim_end().to_string();
         if text.trim().is_empty() {
+            if self.queue_paused {
+                self.queue_paused = false;
+                self.pump_queue();
+            }
             return;
         }
         save_history_line(&text);
@@ -1293,10 +1390,15 @@ impl App {
     /// if Claude is busy.
     fn enqueue(&mut self, display: String, out: Outgoing) {
         let tag = out.tag();
-        if self.busy() || !self.session_ready() {
+        if self.busy() || !self.session_ready() || self.queue_paused {
             let idx = self.transcript.push(Block::User { text: display, queued: true, tag });
             self.queue.push_back((out, idx));
             self.follow = true;
+            if self.queue_paused {
+                self.queue_paused = false;
+                self.pump_queue();
+                return;
+            }
             if !self.session_ready() && !matches!(self.conn, Conn::Starting(_)) {
                 self.toast("Agent isn't running — /restart to start it");
             }
@@ -1307,7 +1409,7 @@ impl App {
     }
 
     fn pump_queue(&mut self) {
-        if self.busy() || !self.session_ready() {
+        if self.busy() || !self.session_ready() || self.queue_paused {
             return;
         }
         if let Some((out, idx)) = self.queue.pop_front() {
@@ -1321,6 +1423,8 @@ impl App {
                     let e = self.transcript.entries.remove(idx);
                     self.transcript.entries.push(e);
                     // Fix up indices that shifted.
+                    let last = self.transcript.entries.len() - 1;
+                    self.selected = self.selected.map(|s| if s == idx { last } else if s > idx { s - 1 } else { s });
                     for v in self.transcript.tool_index.values_mut() {
                         if *v > idx {
                             *v -= 1;
@@ -1341,6 +1445,39 @@ impl App {
             let new_idx = self.transcript.entries.len() - 1;
             self.send_prompt(out, new_idx);
         }
+    }
+
+    /// Discard prompts held after a stopped turn, and their transcript entries.
+    fn drop_queue(&mut self) {
+        self.queue_paused = false;
+        let mut idxs: Vec<usize> = self.queue.drain(..).map(|(_, i)| i).collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        let n = idxs.len();
+        for idx in idxs {
+            if idx >= self.transcript.entries.len() {
+                continue;
+            }
+            self.transcript.entries.remove(idx);
+            let shift = |v: &mut usize| {
+                if *v > idx {
+                    *v -= 1;
+                }
+            };
+            self.transcript.tool_index.values_mut().for_each(shift);
+            if let Some(p) = self.transcript.plan_entry.as_mut() {
+                shift(p);
+            }
+            self.selected = match self.selected {
+                Some(s) if s == idx => None,
+                Some(mut s) => {
+                    shift(&mut s);
+                    Some(s)
+                }
+                None => None,
+            };
+        }
+        self.invalidate_all();
+        self.toast(format!("Dropped {n} queued prompt{}", if n == 1 { "" } else { "s" }));
     }
 
     /// (config id, value for this turn, value to restore afterwards)
@@ -1416,12 +1553,12 @@ impl App {
             }
             for (id, value, _) in &overrides {
                 let r = set_option_request(&client, &sid, id, value).await;
-                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(value.clone()) } else { AppMsg::ConfigSet(r) });
+                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(value.clone()) } else { AppMsg::ConfigSet(None, r) });
             }
             let r = client.request("session/prompt", json!({"sessionId": sid, "prompt": blocks})).await;
             for (id, _, prev) in overrides.iter().rev() {
                 let r2 = set_option_request(&client, &sid, id, prev).await;
-                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(prev.clone()) } else { AppMsg::ConfigSet(r2) });
+                let _ = tx.send(if id == "__model" { AppMsg::LegacyModel(prev.clone()) } else { AppMsg::ConfigSet(None, r2) });
             }
             let _ = tx.send(AppMsg::PromptDone(r));
         });
@@ -1454,6 +1591,7 @@ impl App {
         self.scroll = 0;
         self.follow = true;
         self.queue.clear();
+        self.queue_paused = false;
     }
 
     async fn run_local(&mut self, name: &str, args: &str) {
@@ -1599,7 +1737,7 @@ impl App {
                     self.enqueue(out.text.clone(), out);
                 }
             }
-            "narrator" => self.toggle_narrator(),
+            "narrator" => self.toggle_narrator(false),
             "compact-mode" => self.toggle_compact(),
             "context" => {
                 let s = &self.session;
@@ -1632,13 +1770,16 @@ impl App {
             "thinking" => {
                 self.transcript.show_thinking = !self.transcript.show_thinking;
                 self.config.ui.show_thinking = self.transcript.show_thinking;
-                let _ = self.config.save();
+                let on = self.config.ui.show_thinking;
+                Config::persist(|c| c.ui.show_thinking = on);
                 self.toast(if self.transcript.show_thinking { "Thinking shown" } else { "Thinking hidden" });
             }
             "timestamps" => {
                 self.config.ui.show_timestamps = !self.config.ui.show_timestamps;
-                let _ = self.config.save();
+                let on = self.config.ui.show_timestamps;
+                Config::persist(|c| c.ui.show_timestamps = on);
                 self.invalidate_all();
+                self.toast(if on { "Timestamps shown" } else { "Timestamps hidden" });
             }
             "restart" => {
                 self.transcript.notice(Level::Info, "Restarting Claude Code…");
@@ -1650,7 +1791,10 @@ impl App {
             "config" => {
                 self.transcript.notice(Level::Info, format!("Config file: {}", crate::config::config_path().display()));
             }
-            "shortcuts" | "help" | "keys" => self.overlay = Overlay::Shortcuts,
+            "shortcuts" | "help" | "keys" => {
+                self.shortcuts_scroll = 0;
+                self.overlay = Overlay::Shortcuts;
+            }
             "quit" | "exit" | "q" => self.should_quit = true,
             _ => {}
         }
@@ -1748,7 +1892,7 @@ impl App {
         self.theme = cfg.theme();
         if persist {
             self.config = cfg;
-            let _ = self.config.save();
+            Config::persist(|c| c.ui.theme = name.to_string());
         }
         self.invalidate_all();
     }
@@ -1756,7 +1900,11 @@ impl App {
     fn picker_choose(&mut self) {
         let Overlay::Picker(p) = std::mem::replace(&mut self.overlay, Overlay::None) else { return };
         let vis = p.visible();
-        let Some(item) = vis.get(p.sel).and_then(|i| p.items.get(*i)).cloned() else { return };
+        let Some(item) = vis.get(p.sel).and_then(|i| p.items.get(*i)).cloned() else {
+            // Nothing matches the filter: keep the picker open.
+            self.overlay = Overlay::Picker(p);
+            return;
+        };
         match p.kind {
             PickerKind::Model => {
                 if let Some(id) = self.session.option("model").map(|o| o.id.clone()) {
@@ -1870,7 +2018,13 @@ impl App {
                 }
             }
             let names: Vec<String> = all.iter().map(|a| a.0.clone()).collect();
-            let order = fuzzy_filter(q, &names);
+            let mut order = fuzzy_filter(q, &names);
+            // An exact name always wins: `/compact` must not resolve to
+            // `/compact-mode`, nor `/mode` to `/model`, on a score tie.
+            if let Some(p) = order.iter().position(|&i| names[i].eq_ignore_ascii_case(q)) {
+                let i = order.remove(p);
+                order.insert(0, i);
+            }
             let items: Vec<_> = order.into_iter().map(|i| all[i].clone()).collect();
             if items.is_empty() {
                 self.completion = None;
@@ -1907,6 +2061,11 @@ impl App {
                     let takes_args = matches!(name.as_str(), "export" | "resume" | "theme" | "model" | "effort" | "mode" | "plan")
                         && !local;
                     self.input.set(&format!("/{name}"));
+                    if *local && name == "after" {
+                        // Needs a task to be useful: leave room to type it.
+                        self.input.insert_char(' ');
+                        return false;
+                    }
                     if takes_args || !*local {
                         // Agent commands may take arguments: leave a space.
                         let hint = self.session.commands.iter().find(|c| c.name == *name).map(|c| !c.hint.is_empty()).unwrap_or(false);
@@ -1964,7 +2123,9 @@ impl App {
     async fn on_mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::ScrollUp => {
-                if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
+                if matches!(self.overlay, Overlay::Shortcuts) {
+                    self.shortcuts_scroll = self.shortcuts_scroll.saturating_sub(3);
+                } else if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
                     *scroll = scroll.saturating_sub(3);
                 } else if let Overlay::Picker(p) = &mut self.overlay {
                     p.sel = p.sel.saturating_sub(1);
@@ -1974,8 +2135,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
-                    *scroll += 3;
+                if matches!(self.overlay, Overlay::Shortcuts) {
+                    self.shortcuts_scroll = (self.shortcuts_scroll + 3).min(self.layout.shortcuts_max);
+                } else if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
+                    *scroll = (*scroll + 3).min(self.layout.viewer_max);
                 } else if let Overlay::Picker(p) = &mut self.overlay {
                     let n = p.visible().len();
                     if p.sel + 1 < n {
@@ -1999,7 +2162,7 @@ impl App {
                 }
                 if let Some(b) = self.layout.narrator_button {
                     if b.contains((x, y).into()) {
-                        self.toggle_narrator();
+                        self.toggle_narrator(true);
                         return;
                     }
                 }
@@ -2054,7 +2217,8 @@ impl App {
 
     pub fn toggle_compact(&mut self) {
         self.config.ui.compact = !self.config.ui.compact;
-        let _ = self.config.save();
+        let on = self.config.ui.compact;
+        Config::persist(|c| c.ui.compact = on);
         // Keep the selection on something that's still shown.
         if let Some(sel) = self.selected {
             if let Some((s, _)) = self.group_of(sel).filter(|(s, _)| !self.transcript.entries[*s].group_open) {
@@ -2173,13 +2337,19 @@ impl App {
                 self.completion = None;
                 return;
             }
-            if self.responding {
+            // Once a stop has been requested, further presses fall through so
+            // a stuck agent can't keep you from clearing the prompt or quitting.
+            if self.responding && !self.cancelling {
                 self.cancel_turn();
                 return;
             }
             if !self.input.is_empty() {
                 self.input.clear();
                 self.completion = None;
+                return;
+            }
+            if self.queue_paused {
+                self.drop_queue();
                 return;
             }
             if self.quit_armed.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
@@ -2191,32 +2361,56 @@ impl App {
             return;
         }
         if ctrl && matches!(k.code, KeyCode::Char('d')) && self.input.is_empty() && self.focus == Focus::Prompt {
-            self.should_quit = true;
+            // Quit straight away when idle; mid-turn, ask for a second press.
+            let busy = self.responding || !self.queue.is_empty();
+            if !busy || self.quit_armed.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                self.should_quit = true;
+            } else {
+                self.quit_armed = Some(Instant::now());
+                self.toast("Claude is still working: press Ctrl+D again to quit");
+            }
             return;
         }
         if k.code == KeyCode::F(1)
             || (ctrl && matches!(k.code, KeyCode::Char('.') | KeyCode::Char('/') | KeyCode::Char('7') | KeyCode::Char('_')))
         {
-            self.overlay = if matches!(self.overlay, Overlay::Shortcuts) { Overlay::None } else { Overlay::Shortcuts };
+            if matches!(self.overlay, Overlay::Shortcuts) {
+                self.overlay = Overlay::None;
+            } else {
+                self.picker_cancel(); // undo a live theme preview
+                self.shortcuts_scroll = 0;
+                self.overlay = Overlay::Shortcuts;
+            }
             return;
         }
 
         // Overlays
         match &mut self.overlay {
             Overlay::Shortcuts => {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')) {
-                    self.overlay = Overlay::None;
+                let max = self.layout.shortcuts_max;
+                let s = &mut self.shortcuts_scroll;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = Overlay::None,
+                    KeyCode::Up | KeyCode::Char('k') => *s = s.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => *s = (*s + 1).min(max),
+                    KeyCode::PageUp => *s = s.saturating_sub(10),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *s = (*s + 10).min(max),
+                    KeyCode::Home | KeyCode::Char('g') => *s = 0,
+                    KeyCode::End | KeyCode::Char('G') => *s = max,
+                    _ => {}
                 }
                 return;
             }
             Overlay::Viewer { scroll, text, .. } => {
-                let max = text.lines().count();
+                let max = self.layout.viewer_max;
+                let page = self.layout.viewer_page.saturating_sub(2).max(1);
+                *scroll = (*scroll).min(max);
                 match k.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.overlay = Overlay::None,
                     KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
                     KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(max),
-                    KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
-                    KeyCode::PageDown | KeyCode::Char(' ') => *scroll = (*scroll + 20).min(max),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(page),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *scroll = (*scroll + page).min(max),
                     KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
                     KeyCode::End | KeyCode::Char('G') => *scroll = max,
                     KeyCode::Char('y') => {
@@ -2268,6 +2462,10 @@ impl App {
         // Blocking cards
         if !self.permissions.is_empty() {
             let n = self.permissions[0].options.len();
+            let settling = self.permissions[0].shown.elapsed() < Duration::from_millis(600);
+            if settling && matches!(k.code, KeyCode::Enter | KeyCode::Char(_)) {
+                return;
+            }
             match k.code {
                 KeyCode::Up | KeyCode::BackTab => {
                     let c = &mut self.permissions[0];
@@ -2288,8 +2486,11 @@ impl App {
                     }
                 }
                 KeyCode::Char('y') => {
-                    let i = self.permissions[0].options.iter().position(|o| o.2 == "allow_once").unwrap_or(0);
-                    self.answer_permission(Some(i));
+                    let opts = &self.permissions[0].options;
+                    let i = opts.iter().position(|o| o.2 == "allow_once").or_else(|| opts.iter().position(|o| o.2 == "allow_always"));
+                    if let Some(i) = i {
+                        self.answer_permission(Some(i));
+                    }
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.answer_permission(None),
                 KeyCode::PageUp => self.scroll_by(10),
@@ -2453,9 +2654,11 @@ impl App {
             }
             KeyCode::Char('o') | KeyCode::Char('r') => match self.selected_path() {
                 Some(p) => {
-                    let r = if k.code == KeyCode::Char('o') { peek::open(&p) } else { peek::reveal(&p) };
-                    if let Err(e) = r {
-                        self.toast(format!("Couldn't open {}: {e}", p.display()));
+                    let r = if k.code == KeyCode::Char('o') { peek::open(&p) } else { peek::reveal(&p).map(|_| peek::Opened::Opened) };
+                    match r {
+                        Ok(peek::Opened::Revealed) => self.toast("Runnable file: revealed it instead of running it"),
+                        Ok(peek::Opened::Opened) => {}
+                        Err(e) => self.toast(format!("Couldn't open {}: {e}", p.display())),
                     }
                 }
                 None => self.toast("No file on this entry"),
