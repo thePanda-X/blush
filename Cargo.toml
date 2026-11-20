@@ -1,6 +1,6 @@
 [package]
 name = "blush"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "A Grok-Build-style fullscreen coding-agent TUI that drives Claude Code over the Agent Client Protocol"
 license = "Apache-2.0"
