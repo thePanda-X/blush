@@ -14,7 +14,6 @@ pub const DIAMOND_HOLLOW: &str = "◇";
 pub const PROMPT_ARROW: &str = "❯ ";
 pub const RAIL: &str = "┃";
 pub const SELECT_BAR: &str = "▎";
-pub const DOT_SPINNER: &[&str] = &["⋅", ":", "⸬", "⁙", "⸬", ":"];
 pub const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[allow(dead_code)]
@@ -66,18 +65,18 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
             // `m` in the scrollback: the markdown source, as Claude wrote it.
             let style = Style::default().fg(th.gray_bright);
             let mut lines = Vec::new();
-            for l in text.trim_end().lines() {
+            for l in entry.visible(text).trim_end().lines() {
                 lines.extend(hard_wrap(vec![Span::styled(sanitize(l), style)], w.saturating_sub(10), vec![]));
             }
             Rendered { lines, band: false, header_rows: 0 }
         }
         Block::Agent { text } => {
-            let lines = markdown::render(text, w.saturating_sub(10), th);
+            let lines = markdown::render(entry.visible(text), w.saturating_sub(10), th);
             Rendered { lines, band: false, header_rows: 0 }
         }
         Block::Aside { question, answer, started, ended, failed } => aside(question, answer, *started, *ended, *failed, ctx),
         Block::Thought { text, started, ended } => {
-            let mut header = vec![bullet(th, ctx.tick, ended.is_none(), false, th.accent_thinking)];
+            let mut header = vec![bullet(th, ctx.tick, ended.is_none(), false, th.accent_thinking, entry.settling())];
             match ended {
                 Some(d) => {
                     header.push(Span::styled("Thought", th.secondary()));
@@ -91,7 +90,7 @@ pub fn render(entry: &Entry, ctx: &Ctx) -> Rendered {
             let mut lines = vec![Line::from(header)];
             if entry.fold == Fold::Expanded && !text.trim().is_empty() {
                 let style = Style::default().fg(th.gray_bright).add_modifier(Modifier::ITALIC);
-                for para in sanitize(text.trim()).split("\n\n") {
+                for para in sanitize(entry.visible(text).trim()).split("\n\n") {
                     lines.extend(wrap_spans(
                         vec![Span::styled(para.replace('\n', " "), style)],
                         w,
@@ -148,7 +147,7 @@ fn aside(
     let th = ctx.theme;
     let w = ctx.width.max(10);
     let live = ended.is_none();
-    let mut header = vec![bullet(th, ctx.tick, live, failed, th.info), Span::styled("btw ", Style::default().fg(th.info).add_modifier(Modifier::BOLD))];
+    let mut header = vec![bullet(th, ctx.tick, live, failed, th.info, None), Span::styled("btw ", Style::default().fg(th.info).add_modifier(Modifier::BOLD))];
     let meta = match ended {
         Some(d) => format!("  {}", human_duration(d)),
         None => format!("  answering… {}", human_duration(started.elapsed())),
@@ -172,8 +171,18 @@ fn aside(
     Rendered { lines, band: false, header_rows: 0 }
 }
 
-fn bullet(th: &Theme, tick: u64, live: bool, failed: bool, live_color: ratatui::style::Color) -> Span<'static> {
-    let color = if failed {
+/// The `◆` before a block: pulsing while live, then a brief flash (success
+/// green, or a bright pop into red on failure) that settles to its rest color.
+fn bullet(th: &Theme, tick: u64, live: bool, failed: bool, live_color: ratatui::style::Color, settle: Option<f32>) -> Span<'static> {
+    let color = if let (false, Some(t)) = (live, settle) {
+        let k = crate::anim::ease_in_out(t);
+        if failed {
+            blend(th.text, th.error, k)
+        } else {
+            let flash = if t < 0.15 { blend(live_color, th.success, t / 0.15) } else { th.success };
+            blend(flash, th.gray, k)
+        }
+    } else if failed {
         th.error
     } else if live {
         blend(th.bg, live_color, wave(tick, 0))
@@ -375,7 +384,7 @@ pub fn group_summary(members: &[&Entry], ctx: &Ctx, open: bool) -> Line<'static>
     let mut spans = if open {
         vec![Span::styled("▾ ", Style::default().fg(blend(th.bg, th.accent, 0.7)))]
     } else {
-        vec![bullet(th, ctx.tick, live.is_some(), false, th.accent)]
+        vec![bullet(th, ctx.tick, live.is_some(), false, th.accent, None)]
     };
     // Compact groups are tinted with the accent (pink in the default theme).
     let pink = Style::default().fg(if open { blend(th.bg, th.accent, 0.75) } else { th.accent });
@@ -442,7 +451,7 @@ fn tool(entry: &Entry, t: &ToolCall, ctx: &Ctx) -> Rendered {
     let w = ctx.width;
     let live = matches!(t.status, ToolStatus::Pending | ToolStatus::Running);
     let failed = t.status == ToolStatus::Failed;
-    let mut header = vec![bullet(th, ctx.tick, live, failed, th.accent)];
+    let mut header = vec![bullet(th, ctx.tick, live, failed, th.accent, entry.settling())];
     let mut label = tool_label(t, th);
     // meta on the right
     let mut meta: Vec<Span<'static>> = Vec::new();

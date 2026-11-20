@@ -11,12 +11,41 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as WBlock, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::{App, Completion, Conn, FieldKind, Focus, LayoutInfo, Overlay};
-use crate::blocks::{self, BRAILLE, DIAMOND, DOT_SPINNER, PROMPT_ARROW, RAIL, SELECT_BAR};
+use crate::anim::{self, ease_out, fade_rect, progress, tick_ms};
+use crate::blocks::{self, BRAILLE, DIAMOND, PROMPT_ARROW, RAIL, SELECT_BAR};
 use crate::model::{Block, Entry, Fold, RenderCache, ToolStatus, short_mode};
 use crate::text::{human_duration, human_tokens, line_width, sanitize, truncate, truncate_left, wrap_spans};
 use crate::usage::until;
 use crate::theme::{Theme, blend, wave};
 
+
+/// How long an unfolding block takes to roll open.
+pub const UNFOLD: Duration = Duration::from_millis(180);
+/// How long popups, menus and cards take to fade in.
+pub const POPUP_FADE: Duration = Duration::from_millis(160);
+/// The footer's subscription meter alternates windows this often…
+const METER_PERIOD_MS: u64 = 6000;
+/// …crossfading over this long at each end.
+const METER_FADE_MS: u64 = 260;
+
+/// Whether the footer meter is mid-crossfade (needs redraws).
+pub fn meter_fading(tick: u64) -> bool {
+    meter_alpha(tick) < 1.0
+}
+
+fn meter_alpha(tick: u64) -> f32 {
+    let p = tick_ms(tick) % METER_PERIOD_MS;
+    let edge = p.min(METER_PERIOD_MS - p);
+    ease_out((edge as f32 / METER_FADE_MS as f32).min(1.0))
+}
+
+/// Mark which popup is showing, restarting its fade when it changes.
+fn track_popup(slot: &mut (u8, std::time::Instant), key: u8) -> f32 {
+    if slot.0 != key {
+        *slot = (key, std::time::Instant::now());
+    }
+    ease_out(progress(slot.1, POPUP_FADE))
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let th = app.theme.clone();
@@ -85,16 +114,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_card(f, app, &th, card, card_lines);
         layout.card_area = Some(card);
     }
+    let card_key = if card_h == 0 { 0 } else if !app.permissions.is_empty() { 1 } else { 2 };
+    let card_alpha = track_popup(&mut app.popup[1], card_key);
+    if card_h > 0 {
+        fade_rect(f.buffer_mut(), card, th.bg, card_alpha);
+    }
     draw_prompt(f, app, &th, prompt, prompt_inner_w);
     draw_footer(f, app, &th, footer, &mut layout);
-    draw_completion(f, app, &th, prompt);
+    draw_completion(f, app, &th, prompt, &mut layout);
 
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Picker(_) => draw_picker(f, app, &th, full),
+        Overlay::Picker(_) => draw_picker(f, app, &th, full, &mut layout),
         Overlay::Shortcuts => draw_shortcuts(f, app, &th, full, &mut layout),
         Overlay::Viewer { .. } => draw_viewer(f, app, &th, full, &mut layout),
         Overlay::Settings { .. } => draw_settings(f, app, &th, full, &mut layout),
+    }
+    let popup_key = match &app.overlay {
+        Overlay::None if layout.popup.is_some() => 1,
+        Overlay::None => 0,
+        Overlay::Picker(_) => 2,
+        Overlay::Shortcuts => 3,
+        Overlay::Viewer { .. } => 4,
+        Overlay::Settings { .. } => 5,
+    };
+    let alpha = track_popup(&mut app.popup[0], popup_key);
+    if let Some(r) = layout.popup {
+        fade_rect(f.buffer_mut(), r, th.bg, alpha);
     }
     app.layout = layout;
 }
@@ -103,8 +149,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, app: &App, th: &Theme, r: Rect) {
     let cwd = app.git_label.clone().unwrap_or_else(|| display_path(&app.cwd));
+    let used = app.tweens.header_used.get(app.session.used as f64).round() as u64;
     let right = if app.session.size > 0 {
-        format!("{} / {}", human_tokens(app.session.used), human_tokens(app.session.size))
+        format!("{} / {}", human_tokens(used), human_tokens(app.session.size))
     } else {
         String::new()
     };
@@ -119,7 +166,7 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, r: Rect) {
     }
     f.render_widget(Paragraph::new(Line::from(spans)), r);
     if !right.is_empty() {
-        let pct = app.session.used as f64 / app.session.size.max(1) as f64;
+        let pct = used as f64 / app.session.size.max(1) as f64;
         let color = if pct > 0.85 { th.error } else if pct > 0.65 { th.warning } else { th.text };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(right, Style::default().fg(color)))).alignment(Alignment::Right),
@@ -171,7 +218,7 @@ pub fn git_label(cwd: &std::path::Path) -> Option<String> {
 // ---------------------------------------------------------------- scrollback
 
 fn entry_lines(entry: &Entry, width: u16, th: &Theme, tick: u64, show_ts: bool, ts_minimal: bool) -> (Rc<Vec<Line<'static>>>, bool, usize) {
-    let live = entry.is_live();
+    let live = entry.is_live() || entry.shown.is_some() || entry.settling().is_some();
     if !live {
         if let Some(c) = entry.cache.borrow().as_ref() {
             if c.width == width && c.rev == entry.rev && c.fold == entry.fold {
@@ -345,10 +392,11 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             }
             first_in_open_group = true;
         }
-        let (lines, band, hdr) = entry_lines(e, content_w, th, tick, show_ts, ts_minimal);
+        let (mut lines, band, hdr) = entry_lines(e, content_w, th, tick, show_ts, ts_minimal);
         if lines.is_empty() {
             continue;
         }
+        lines = unroll(e, lines, hdr);
         let gap = match prev {
             None => 0,
             _ if first_in_open_group => 0,
@@ -392,7 +440,17 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
     }
     let max_scroll = total.saturating_sub(view_h);
     app.scroll = app.scroll.min(max_scroll);
-    let top = total.saturating_sub(view_h + app.scroll);
+    // Glide toward the scroll target rather than jumping there.
+    let now = std::time::Instant::now();
+    let dt = now.duration_since(app.scroll_at).as_secs_f32().min(0.05);
+    app.scroll_at = now;
+    let target = app.scroll as f32;
+    app.scroll_shown += (target - app.scroll_shown) * (1.0 - (-dt / 0.06).exp());
+    if (target - app.scroll_shown).abs() < 0.5 {
+        app.scroll_shown = target;
+    }
+    app.scroll_shown = app.scroll_shown.clamp(0.0, max_scroll as f32);
+    let top = total.saturating_sub(view_h + app.scroll_shown.round() as usize);
     // When content is shorter than the view, pin it to the top.
     let buf = f.buffer_mut();
     let x0 = r.x;
@@ -474,6 +532,25 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
     }
 }
 
+/// A block that just unfolded rolls open over [`UNFOLD`]: its body rows
+/// appear top to bottom, pushing what's below down smoothly.
+fn unroll(e: &Entry, lines: Rc<Vec<Line<'static>>>, hdr: usize) -> Rc<Vec<Line<'static>>> {
+    if e.fold_seen.get() != e.fold {
+        e.fold_seen.set(e.fold);
+        e.unfolded_at.set((e.fold == Fold::Expanded).then(std::time::Instant::now));
+    }
+    let Some(at) = e.unfolded_at.get() else { return lines };
+    let t = progress(at, UNFOLD);
+    if t >= 1.0 {
+        e.unfolded_at.set(None);
+        return lines;
+    }
+    let head = hdr.max(1).min(lines.len());
+    let body = lines.len() - head;
+    let keep = head + (body as f32 * ease_out(t)).ceil() as usize;
+    if keep >= lines.len() { lines } else { Rc::new(lines[..keep].to_vec()) }
+}
+
 fn rail_for(entry: &Entry, selected: bool, th: &Theme, tick: u64, row: u16) -> Option<(&'static str, Style)> {
     if selected {
         return Some((SELECT_BAR, Style::default().fg(th.accent)));
@@ -499,7 +576,7 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     let mut right: Vec<Span> = Vec::new();
     match &app.conn {
         Conn::Starting(msg) => {
-            left.push(Span::styled(format!("{} ", BRAILLE[(tick as usize / 2) % BRAILLE.len()]), th.accent()));
+            left.push(Span::styled(format!("{} ", anim::frame(BRAILLE, tick, 80)), th.accent()));
             left.push(Span::styled(msg.clone(), th.secondary()));
         }
         Conn::Failed(e) => {
@@ -517,7 +594,7 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         Conn::Ready => {}
     }
     if app.responding {
-        let spin = DOT_SPINNER[(tick as usize / 2) % DOT_SPINNER.len()];
+        let spin = anim::frame(BRAILLE, tick, 80);
         let elapsed = app.turn_started.map(|t| t.elapsed()).unwrap_or_default();
         let activity = if app.cancelling {
             "Cancelling…".to_string()
@@ -539,19 +616,15 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
                 _ => "Responding…".into(),
             }
         };
-        left = vec![
-            Span::styled(format!("{spin} "), th.accent()),
-            Span::styled(activity, th.secondary()),
-            Span::styled(format!(" {}", human_duration_short(elapsed)), th.muted()),
-        ];
+        left = vec![Span::styled(format!("{spin} "), th.accent())];
+        left.extend(anim::shimmer(&activity, tick, th.text_secondary, th.text));
+        left.push(Span::styled(format!(" {}", human_duration_short(elapsed)), th.muted()));
         if let Some(tag) = &app.turn_tag {
             left.push(Span::styled(format!(" · {tag}"), th.accent()));
         }
         right.extend(context_meter(app, th));
-        right.push(Span::styled(
-            format!("⇣{} ", human_tokens((app.turn_chars / 4) as u64)),
-            th.muted(),
-        ));
+        let out = app.tweens.out_tokens.get((app.turn_chars / 4) as f64).round() as u64;
+        right.push(Span::styled(format!("⇣{} ", human_tokens(out)), th.muted()));
         right.push(Span::styled("[stop]", Style::default().fg(th.gray_bright)));
         let stop_x = r.x + r.width - 6;
         layout.stop_button = Some(Rect { x: stop_x, y: r.y, width: 6, height: 1 });
@@ -609,11 +682,14 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         ];
     }
     if let Some((msg, at)) = &app.toast {
-        if at.elapsed() < Duration::from_millis(2500) {
+        let ms = at.elapsed().as_millis() as f32;
+        if ms < 2500.0 {
+            // Fade in quickly, hold, then fade out over the last 400ms.
+            let a = ease_out((ms / 150.0).min(1.0)) * ease_out(((2500.0 - ms) / 400.0).min(1.0));
             if !left.is_empty() {
-                left.push(Span::styled("  ·  ", th.dim()));
+                left.push(Span::styled("  ·  ", Style::default().fg(blend(th.bg, th.gray_dim, a))));
             }
-            left.push(Span::styled(msg.clone(), Style::default().fg(th.accent)));
+            left.push(Span::styled(msg.clone(), Style::default().fg(blend(th.bg, th.accent, a))));
         }
     }
     f.render_widget(Paragraph::new(Line::from(left)), Rect { x: r.x + 1, width: r.width.saturating_sub(1), ..r });
@@ -626,7 +702,7 @@ fn context_meter(app: &App, th: &Theme) -> Vec<Span<'static>> {
     if app.session.size == 0 || app.session.used == 0 {
         return vec![];
     }
-    let pct = app.session.used as f64 * 100.0 / app.session.size as f64;
+    let pct = app.tweens.context.get(app.session.used as f64 * 100.0 / app.session.size as f64);
     let style = if pct >= 75.0 {
         Style::default().fg(th.error)
     } else if pct >= 50.0 {
@@ -806,7 +882,12 @@ fn draw_card(f: &mut Frame, app: &App, th: &Theme, r: Rect, lines: Vec<Line<'sta
 
 fn draw_prompt(f: &mut Frame, app: &App, th: &Theme, r: Rect, inner_w: usize) {
     let focused = app.focus == Focus::Prompt && app.permissions.is_empty() && app.question.is_none() && matches!(app.overlay, Overlay::None);
-    let border = if focused { th.border_active } else { th.border };
+    let mut border = if focused { th.border_active } else { th.border };
+    if app.responding {
+        // A slow breath toward the accent while Claude works.
+        let ph = tick_ms(app.tick) as f32 / 2400.0 * std::f32::consts::TAU;
+        border = blend(border, th.accent, 0.12 + 0.33 * (0.5 - 0.5 * ph.cos()));
+    }
     let mode = &app.session.mode;
     let mode_color = match mode.as_str() {
         "plan" => th.plan,
@@ -977,16 +1058,22 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     let mut right: Vec<Span> = Vec::new();
     let windows = crate::usage::meter_windows(&app.limits);
     if app.config.features.sub_meter && !windows.is_empty() {
-        let w = windows[(app.tick as usize / 120) % windows.len()];
+        let w = windows[(tick_ms(app.tick) / METER_PERIOD_MS) as usize % windows.len()];
+        // Crossfade between windows; the bar slides to each window's fill.
+        let a = if windows.len() > 1 { meter_alpha(app.tick) } else { 1.0 };
+        let fade = |c: ratatui::style::Color| Style::default().fg(blend(th.bg, c, a));
+        let pct = app.tweens.sub_meter.get(w.percent);
         let cells = 10usize;
-        let filled = ((w.percent / 100.0) * cells as f64).round().clamp(0.0, cells as f64) as usize;
+        let filled = ((pct / 100.0) * cells as f64).round().clamp(0.0, cells as f64) as usize;
         let color = if w.percent >= 90.0 { th.error } else if w.percent >= 70.0 { th.warning } else { th.accent };
-        right.push(Span::styled(format!("{} ", w.label), th.muted()));
-        right.push(Span::styled("▰".repeat(filled), Style::default().fg(color)));
-        right.push(Span::styled("▱".repeat(cells - filled), th.dim()));
-        right.push(Span::styled(format!(" {:.0}%", w.percent), Style::default().fg(th.text_secondary)));
+        let muted = th.muted().fg.unwrap_or(th.gray);
+        let dim = th.dim().fg.unwrap_or(th.gray_dim);
+        right.push(Span::styled(format!("{} ", w.label), fade(muted)));
+        right.push(Span::styled("▰".repeat(filled), fade(color)));
+        right.push(Span::styled("▱".repeat(cells - filled), fade(dim)));
+        right.push(Span::styled(format!(" {pct:.0}%"), fade(th.text_secondary)));
         if let Some(t) = w.resets {
-            right.push(Span::styled(format!(" · {}", until(t, chrono::Local::now())), th.dim()));
+            right.push(Span::styled(format!(" · {}", until(t, chrono::Local::now())), fade(dim)));
         }
         right.push(Span::styled("   ", th.dim()));
     }
@@ -1026,7 +1113,7 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
 
 // ---------------------------------------------------------------- completion popup
 
-fn draw_completion(f: &mut Frame, app: &App, th: &Theme, prompt: Rect) {
+fn draw_completion(f: &mut Frame, app: &App, th: &Theme, prompt: Rect, layout: &mut LayoutInfo) {
     let Some(c) = &app.completion else { return };
     if app.focus != Focus::Prompt {
         return;
@@ -1085,6 +1172,7 @@ fn draw_completion(f: &mut Frame, app: &App, th: &Theme, prompt: Rect) {
     let y = prompt.y.saturating_sub(h);
     let r = Rect { x: prompt.x, y, width: prompt.width, height: h };
     f.render_widget(Clear, r);
+    layout.popup = Some(r);
     let block = WBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1130,13 +1218,14 @@ fn dim_background(buf: &mut Buffer, area: Rect, th: &Theme) {
     }
 }
 
-fn draw_picker(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+fn draw_picker(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {
     let Overlay::Picker(p) = &app.overlay else { return };
     dim_background(f.buffer_mut(), area, th);
     let vis = p.visible();
     let list_h = vis.len().clamp(1, 14) as u16;
     let r = centered(area, 72, list_h + 5);
     f.render_widget(Clear, r);
+    layout.popup = Some(r);
     let block = modal_block(th, &p.title);
     let inner = block.inner(r);
     f.render_widget(block, r);
@@ -1282,6 +1371,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
     let width = if two_cols { 2 * col_w + 4 + 4 } else { col_w + 4 };
     let r = centered(area, width as u16, rows as u16 + 4);
     f.render_widget(Clear, r);
+    layout.popup = Some(r);
     let block = modal_block(th, "Shortcuts");
     let inner = block.inner(r);
     f.render_widget(block, r);
@@ -1311,6 +1401,7 @@ fn draw_settings(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut 
     let sel = sel.min(items.len().saturating_sub(1));
     let r = centered(area, 84, items.len() as u16 + 6);
     f.render_widget(Clear, r);
+    layout.popup = Some(r);
     let block = modal_block(th, "Settings");
     let inner = block.inner(r);
     f.render_widget(block, r);
@@ -1349,6 +1440,7 @@ fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut La
     let Overlay::Viewer { title, text, scroll } = &app.overlay else { return };
     let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
     f.render_widget(Clear, r);
+    layout.popup = Some(r);
     let block = modal_block(th, &truncate(title, (r.width as usize).saturating_sub(6)))
         .title_bottom(hint_line(th, &[("↑↓", "scroll"), ("y", "copy"), ("Esc", "close")]).alignment(Alignment::Right))
         .style(th.base());
@@ -1440,6 +1532,44 @@ mod tests {
         // The card's options stay visible even when it has to be clipped.
         let small = screen(&mut app, 60, 14);
         assert!(small.contains("Reject"), "{small}");
+    }
+
+    #[test]
+    fn animations_mid_flight() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.ui.show_timestamps = false;
+        let mut app = App::new(cfg, std::env::temp_dir(), tx, SessionKind::New);
+        app.transcript.entries.clear();
+        let mut s = crate::model::Session::default();
+        app.responding = true;
+        app.turn_started = Some(std::time::Instant::now());
+        app.transcript.animate_stream = true;
+        app.transcript.push(Block::User { text: "hi".into(), queued: false, tag: None });
+        let text = "The quick brown fox jumps over the lazy dog, again and again and again.";
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}));
+        app.toast("Copied");
+
+        // Streamed text trickles in rather than landing all at once.
+        let first = screen(&mut app, 80, 20);
+        assert!(!first.contains("again."), "{first}");
+        assert!(first.contains("Responding…"), "{first}");
+        assert!(BRAILLE.iter().any(|b| first.contains(&format!("{b} Responding…"))), "{first}");
+        while app.reveal_stream() {}
+        let done = screen(&mut app, 80, 20);
+        assert!(done.contains("again."), "{done}");
+
+        // A tool that just finished flashes, a block that just opened rolls
+        // open, and a popup fades in: none of it may panic at any size.
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"tool_call","toolCallId":"1","title":"Read a.txt","kind":"read","status":"completed",
+            "content":[{"type":"content","content":{"type":"text","text":"1\n2\n3\n4\n5\n6"}}]}));
+        assert!(app.transcript.entries.last().unwrap().settling().is_some());
+        app.transcript.entries.last_mut().unwrap().fold = Fold::Expanded;
+        app.overlay = Overlay::Shortcuts;
+        for (w, h) in [(20u16, 8u16), (40, 12), (80, 20), (120, 40)] {
+            screen(&mut app, w, h);
+        }
+        assert!(app.animating());
     }
 
     #[test]

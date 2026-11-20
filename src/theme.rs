@@ -391,6 +391,7 @@ pub fn blend(a: Color, b: Color, t: f32) -> Color {
 
 /// Brightness of a travelling wave used for running rails / bullets.
 pub fn wave(tick: u64, row: u16) -> f32 {
-    let phase = (tick as f32) * 0.35 - (row as f32) * 0.55;
+    // 0.35 rad per 50ms frame, kept at that speed whatever the tick length.
+    let phase = (crate::anim::tick_ms(tick) as f32) * 0.007 - (row as f32) * 0.55;
     0.45 + 0.55 * (0.5 + 0.5 * phase.sin())
 }

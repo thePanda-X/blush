@@ -91,6 +91,12 @@ pub struct Entry {
     pub group_open: bool,
     /// Show a response's markdown source instead of rendering it.
     pub raw: bool,
+    /// Streamed text revealed so far (bytes), while it trickles in; `None`
+    /// once it has caught up.
+    pub shown: Option<usize>,
+    /// Fold state at the last draw, and when it last opened (expand animation).
+    pub fold_seen: std::cell::Cell<Fold>,
+    pub unfolded_at: std::cell::Cell<Option<Instant>>,
 }
 
 #[allow(dead_code)]
@@ -110,7 +116,19 @@ impl Entry {
             _ => Fold::Expanded,
         };
         let uid = NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Entry { uid, block, time: Local::now(), fold, rev: 0, cache: Default::default(), group_open: false, raw: false }
+        Entry {
+            uid,
+            block,
+            time: Local::now(),
+            fold,
+            rev: 0,
+            cache: Default::default(),
+            group_open: false,
+            raw: false,
+            shown: None,
+            fold_seen: std::cell::Cell::new(fold),
+            unfolded_at: std::cell::Cell::new(None),
+        }
     }
 
     pub fn touch(&mut self) {
@@ -123,6 +141,27 @@ impl Entry {
             Block::Tool(t) => !t.content.is_empty() || !t.raw_input.is_null(),
             Block::Plan(_) => true,
             _ => false,
+        }
+    }
+
+    /// How far (0..1) a tool or thought is through its finish flash, if it
+    /// finished very recently.
+    pub fn settling(&self) -> Option<f32> {
+        const FLASH: Duration = Duration::from_millis(700);
+        let (started, ended) = match &self.block {
+            Block::Thought { started, ended: Some(d), .. } => (*started, *d),
+            Block::Tool(t) if !matches!(t.status, ToolStatus::Pending | ToolStatus::Running) => (t.started, t.ended?),
+            _ => return None,
+        };
+        let since = started.elapsed().checked_sub(ended)?;
+        (since < FLASH).then(|| since.as_secs_f32() / FLASH.as_secs_f32())
+    }
+
+    /// The part of a streamed response or thought revealed so far.
+    pub fn visible<'a>(&self, text: &'a str) -> &'a str {
+        match self.shown {
+            Some(n) if n < text.len() => &text[..n],
+            _ => text,
         }
     }
 
@@ -412,6 +451,8 @@ pub struct Transcript {
     pub diff_focus: bool,
     /// Replaying a `/usage` exchange blush ran in the background: skip it.
     pub skipping_usage: bool,
+    /// Reveal streamed text gradually (live turns; not history replays).
+    pub animate_stream: bool,
 }
 
 impl Transcript {
@@ -426,6 +467,7 @@ impl Transcript {
             expand_tools: false,
             diff_focus: false,
             skipping_usage: false,
+            animate_stream: false,
         }
     }
 
@@ -533,19 +575,20 @@ impl Transcript {
     }
 
     fn append_text(&mut self, agent: bool, text: &str) -> usize {
+        let animate = self.animate_stream;
         if let Some(e) = self.entries.last_mut() {
-            match (&mut e.block, agent) {
-                (Block::Agent { text: t }, true) => {
-                    t.push_str(text);
-                    e.touch();
-                    return text.len();
+            let t = match (&mut e.block, agent) {
+                (Block::Agent { text: t }, true) => Some(t),
+                (Block::Thought { text: t, ended: None, .. }, false) => Some(t),
+                _ => None,
+            };
+            if let Some(t) = t {
+                if animate && e.shown.is_none() {
+                    e.shown = Some(t.len());
                 }
-                (Block::Thought { text: t, ended: None, .. }, false) => {
-                    t.push_str(text);
-                    e.touch();
-                    return text.len();
-                }
-                _ => {}
+                t.push_str(text);
+                e.touch();
+                return text.len();
             }
         }
         if agent {
@@ -556,7 +599,39 @@ impl Transcript {
         } else {
             self.push(Block::Thought { text: text.to_string(), started: self.last_activity, ended: None });
         }
+        if animate {
+            if let Some(e) = self.entries.last_mut() {
+                e.shown = Some(0);
+            }
+        }
         text.len()
+    }
+
+    /// Advance the streamed-text reveal one tick. True when anything moved.
+    pub fn reveal_tick(&mut self) -> bool {
+        let mut moved = false;
+        let len = self.entries.len();
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            let Some(n) = e.shown else { continue };
+            let text = match &e.block {
+                Block::Agent { text } | Block::Thought { text, .. } => text.as_str(),
+                _ => "",
+            };
+            // Only the tail of the transcript animates; older text just shows.
+            if n >= text.len() || i + 12 < len {
+                e.shown = None;
+                moved = true;
+                continue;
+            }
+            let backlog = text[n..].chars().count();
+            let step = crate::anim::reveal_step(backlog);
+            let next = text[n..].char_indices().nth(step).map(|(i, _)| n + i).unwrap_or(text.len());
+            // No `touch()`: rev tracks content (web sync, caches); the renderer
+            // skips its cache while `shown` is set.
+            e.shown = if next >= text.len() { None } else { Some(next) };
+            moved = true;
+        }
+        moved
     }
 
     pub fn apply_update(&mut self, session: &mut Session, u: &Value) -> Effects {

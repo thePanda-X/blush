@@ -287,6 +287,8 @@ pub struct LayoutInfo {
     pub shortcuts_max: usize,
     /// Settings overlay: (screen row, item index) of each row, for clicks.
     pub settings_rows: Vec<(u16, usize)>,
+    /// The open popup (overlay or completion menu), for its fade-in.
+    pub popup: Option<Rect>,
 }
 
 pub enum External {
@@ -348,6 +350,14 @@ pub struct App {
     /// Lines scrolled up from the bottom.
     pub scroll: usize,
     pub follow: bool,
+    /// Where the scrollback is drawn: eases toward `scroll`.
+    pub scroll_shown: f32,
+    pub scroll_at: Instant,
+    /// Numbers that count up instead of jumping.
+    pub tweens: crate::anim::Tweens,
+    /// Which popup / card is open (0 = none) and since when, for their
+    /// fade-in: `[overlay or completion menu, permission or question card]`.
+    pub popup: [(u8, Instant); 2],
 
     pub tick: u64,
     /// `repo:branch` shown in the header when cwd is inside a git repo.
@@ -508,6 +518,10 @@ impl App {
             scroll: 0,
             follow: true,
             tick: 0,
+            scroll_shown: 0.0,
+            scroll_at: Instant::now(),
+            tweens: Default::default(),
+            popup: [(0, Instant::now()); 2],
             git_label,
             quit_armed: None,
             shortcuts_scroll: 0,
@@ -562,7 +576,21 @@ impl App {
             || self.shell.is_some()
             || !self.btw.is_empty()
             || matches!(self.conn, Conn::Starting(_))
-            || self.transcript.entries.iter().rev().take(30).any(|e| e.is_live())
+            || self.transcript.entries.iter().rev().take(30).any(|e| {
+                e.is_live()
+                    || e.shown.is_some()
+                    || e.settling().is_some()
+                    || e.unfolded_at.get().is_some_and(|t| t.elapsed() < crate::ui::UNFOLD)
+            })
+            || self.tweens.busy()
+            || (self.scroll_shown - self.scroll as f32).abs() > 0.01
+            || self.popup.iter().any(|(k, at)| *k != 0 && at.elapsed() < crate::ui::POPUP_FADE)
+    }
+
+    /// Reveal streamed text a little more (once per tick). True when it moved.
+    pub fn reveal_stream(&mut self) -> bool {
+        self.transcript.animate_stream = self.responding;
+        self.transcript.reveal_tick()
     }
 
     // ------------------------------------------------------------------
@@ -1729,6 +1757,7 @@ impl App {
         self.narrator.stop();
         self.transcript.begin_turn();
         self.responding = true;
+        self.transcript.animate_stream = true;
         self.cancelling = false;
         self.turn_started = Some(Instant::now());
         self.turn_chars = 0;
