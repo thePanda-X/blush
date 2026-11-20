@@ -409,6 +409,16 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
         prev = Some(&e.block);
     }
     let view_h = r.height as usize;
+    // Detached from the bottom: `scroll` counts lines up from the bottom, so
+    // hold the top row still while the stream (or a resize) changes what's
+    // below it. Otherwise new output drags the text you're reading away.
+    let (prev_total, prev_h) = (app.layout.total_lines, app.layout.view_height);
+    if !app.follow && prev_total > 0 && (prev_total, prev_h) != (total, view_h) {
+        let top = prev_total.saturating_sub(prev_h + app.scroll);
+        let anchored = total.saturating_sub(view_h + top);
+        app.scroll_shown += anchored as f32 - app.scroll as f32;
+        app.scroll = anchored;
+    }
     layout.total_lines = total;
     layout.view_height = view_h;
 
@@ -1504,6 +1514,37 @@ mod tests {
         let open = screen(&mut app, 70, 22);
         println!("--- group expanded ---\n{open}");
         assert!(open.contains("▾ 1 tool · 1 thought · 1 edit") && open.contains("Read calc.py"), "{open}");
+    }
+
+    #[test]
+    fn detached_scrollback_holds_still_while_output_arrives() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.ui.show_timestamps = false;
+        let mut app = App::new(cfg, std::env::temp_dir(), tx, SessionKind::New);
+        app.transcript.entries.clear();
+        for i in 0..40 {
+            app.transcript.push(Block::User { text: format!("msg {i:02}"), queued: false, tag: None });
+        }
+        let first_msg = |s: &str| s.lines().find_map(|l| l.find("msg ").map(|p| l[p..p + 6].to_string()));
+        screen(&mut app, 60, 24);
+        // Scroll up a little: detached.
+        app.follow = false;
+        app.scroll = 8;
+        app.scroll_shown = 8.0;
+        let before = first_msg(&screen(&mut app, 60, 24));
+        for i in 40..50 {
+            app.transcript.push(Block::User { text: format!("msg {i:02}"), queued: false, tag: None });
+        }
+        let after = screen(&mut app, 60, 24);
+        assert_eq!(first_msg(&after), before, "{after}");
+        assert!(!after.contains("msg 49"), "{after}");
+
+        // Following again: the newest output is on screen.
+        app.follow = true;
+        app.scroll_shown = 0.0; // skip the glide back down
+        let attached = screen(&mut app, 60, 24);
+        assert!(attached.contains("msg 49"), "{attached}");
     }
 
     #[test]

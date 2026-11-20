@@ -16,22 +16,31 @@ export function SessionView() {
   const [confirmEnd, setConfirmEnd] = useState(false);
 
   const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
+  // Where we last left scrollTop, so a scroll *up* reads as the user's doing.
+  const lastTop = useRef(0);
   const [atBottom, setAtBottom] = useState(true);
 
+  // Any move up detaches, however small (a trackpad nudge counts); getting
+  // back near the bottom re-attaches.
   const onScroll = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
-    const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-    follow.current = bottom;
-    setAtBottom(bottom);
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (el.scrollTop < lastTop.current - 1 && dist > 2) follow.current = false;
+    else if (dist < 32) follow.current = true;
+    lastTop.current = el.scrollTop;
+    setAtBottom(follow.current);
   }, []);
 
   const toBottom = useCallback((smooth = false) => {
     const el = scroller.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
     follow.current = true;
     setAtBottom(true);
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+    lastTop.current = el.scrollTop;
   }, []);
 
   // Stay pinned to the bottom while following.
@@ -41,11 +50,12 @@ export function SessionView() {
   useEffect(() => {
     follow.current = true;
   }, [attached]);
+  // Size changes that don't come with a render (the viewport, late layout of
+  // markdown or images) keep a following view pinned too.
   useEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
     const ro = new ResizeObserver(() => follow.current && toBottom());
-    ro.observe(el);
+    if (scroller.current) ro.observe(scroller.current);
+    if (content.current) ro.observe(content.current);
     return () => ro.disconnect();
   }, [toBottom]);
 
@@ -125,7 +135,7 @@ export function SessionView() {
 
       <div className="relative min-h-0 flex-1">
         <div ref={scroller} onScroll={onScroll} className="h-full overflow-y-auto overscroll-contain" data-scroller>
-          <div className="mx-auto w-full max-w-4xl space-y-3 px-3 py-4 sm:px-6">
+          <div ref={content} className="mx-auto w-full max-w-4xl space-y-3 px-3 py-4 sm:px-6">
             {!st && <div className="py-10 text-center text-muted animate-pulse-soft">⁙ Connecting to the session…</div>}
             {session?.order.map((uid) => {
               const e = session.entries.get(uid);

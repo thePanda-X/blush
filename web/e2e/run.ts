@@ -416,6 +416,31 @@ async function main() {
     await shot(page, "desktop-11-web-status-notice");
   });
 
+  await step("a small scroll up detaches from a streaming reply, scrolling back re-attaches", async () => {
+    const scroller = page.locator("[data-scroller]");
+    const box = (await scroller.boundingBox())!;
+    await sendPrompt(page, "slow scroll");
+    await page.locator("[data-status=responding]").waitFor();
+    await sleep(500);
+    assert(await scroller.evaluate((el) => el.scrollHeight > el.clientHeight + 100), "transcript too short to scroll");
+    // A trackpad-sized nudge, well under the old 48px threshold.
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -20);
+    await page.locator("[data-action=jump-latest]").waitFor();
+    const top = await scroller.evaluate((el) => el.scrollTop);
+    await sleep(1200);
+    const held = await scroller.evaluate((el) => el.scrollTop);
+    assert(Math.abs(held - top) < 2, `view moved while detached: ${top} -> ${held}`);
+    // Back to the bottom: following again, and it stays there as text arrives.
+    await page.mouse.wheel(0, 5000);
+    await page.locator("[data-action=jump-latest]").waitFor({ state: "detached" });
+    await sleep(800);
+    const dist = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+    assert(dist < 4, `not pinned to the bottom after re-attaching (${dist}px off)`);
+    await page.getByRole("button", { name: "stop" }).click();
+    await waitIdle(page);
+  });
+
   await step("jump-to-latest after scrolling up", async () => {
     await page.locator("[data-scroller]").evaluate((el) => el.scrollTo({ top: 0 }));
     await page.locator("[data-action=jump-latest]").click();
