@@ -52,6 +52,9 @@ pub struct Search {
     pub cur: usize,
 }
 
+/// Permission modes the settings modal cycles through for `agent.default_mode`.
+const DEFAULT_MODES: &[&str] = &["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+
 /// One row of the settings modal.
 pub struct SettingsItem {
     pub key: &'static str,
@@ -1040,6 +1043,12 @@ impl App {
         let f = &self.config.features;
         vec![
             SettingsItem { key: "theme", label: "Theme", value: self.config.ui.theme.clone(), hint: "Enter opens the theme picker" },
+            SettingsItem {
+                key: "default_mode",
+                label: "Default mode",
+                value: self.config.agent.default_mode.trim().to_string(),
+                hint: "permission mode new sessions start in",
+            },
             SettingsItem { key: "density", label: "Density", value: self.density().into(), hint: "how much of each tool call shows" },
             SettingsItem { key: "timestamps", label: "Timestamps", value: self.timestamp_mode().into(), hint: "on · minimal (prompts only) · off" },
             SettingsItem { key: "thinking", label: "Show thinking", value: onoff(self.transcript.show_thinking), hint: "Alt+H" },
@@ -1069,6 +1078,12 @@ impl App {
             "theme" => {
                 self.open_theme_picker();
                 return;
+            }
+            "default_mode" => {
+                let next = cycle(DEFAULT_MODES, self.config.agent.default_mode.trim()).to_string();
+                self.config.agent.default_mode = next.clone();
+                Config::persist(|c| c.agent.default_mode = next);
+                self.toast("Default mode applies to new sessions");
             }
             "density" => {
                 let next = cycle(&["detailed", "balanced", "diff", "grouped"], self.density());
@@ -1439,6 +1454,21 @@ Stop it with `blush web down`.")));
         assert!(app.config.ui.todo_pane);
         app.on_event(key(KeyCode::Esc, KeyModifiers::NONE)).await;
         assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[tokio::test]
+    async fn settings_cycles_default_mode() {
+        let _guard = config_lock();
+        let (mut app, _rx) = app();
+        app.config.agent.default_mode = "plan".into();
+        let i = app.settings_items().iter().position(|it| it.key == "default_mode").unwrap();
+        app.overlay = Overlay::Settings { sel: i };
+        app.on_event(key(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(app.config.agent.default_mode, "auto");
+        assert_eq!(Config::load().agent.default_mode, "auto", "saved to the (test) config file");
+        app.on_event(key(KeyCode::Left, KeyModifiers::NONE)).await;
+        app.on_event(key(KeyCode::Left, KeyModifiers::NONE)).await;
+        assert_eq!(app.config.agent.default_mode, "acceptEdits");
     }
 
     #[tokio::test]

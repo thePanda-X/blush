@@ -483,7 +483,7 @@ todo_pane = true         # pin Claude's todo list while it has open items (Alt+P
 tasks_pane = false       # running and queued work above the prompt (Ctrl+B)
 
 [agent]
-default_mode = "bypassPermissions"   # default | acceptEdits | plan | auto | bypassPermissions
+default_mode = "bypassPermissions"   # default | acceptEdits | plan | auto | bypassPermissions (also in settings, F2)
 model = ""                           # e.g. "opus", "sonnet", or a full model id
 effort = ""                          # low | medium | high | xhigh | max
 use_system_claude = false            # drive the `claude` on PATH instead of the SDK's bundled CLI
