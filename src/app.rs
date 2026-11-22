@@ -11,9 +11,11 @@ use ratatui::layout::Rect;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
+mod bg;
 mod extras;
 mod web;
 
+pub use bg::BgView;
 pub use extras::{Btw, Search, ShellRun, local_title};
 
 use crate::acp::{self, AcpClient, Incoming, RpcError};
@@ -66,6 +68,8 @@ pub enum AppMsg {
     WebCmd(Value),
     /// The outcome of `/web`, `/web up` or `/web down`.
     WebInfo(Result<String, String>),
+    /// A request to stop a background task replied: (its label, result).
+    BgStopped(String, Result<(), String>),
 }
 
 /// A prompt on its way to the agent, with its per-turn overrides.
@@ -190,6 +194,8 @@ pub enum Overlay {
     Viewer { title: String, text: String, scroll: usize },
     /// Settings (F2): toggles saved to config.toml.
     Settings { sel: usize },
+    /// Background tasks and their output (Alt+J, /bg).
+    Tasks(BgView),
 }
 
 pub struct PermissionCard {
@@ -274,6 +280,8 @@ pub struct LayoutInfo {
     pub entry_rows: Vec<(u16, u16, usize, usize, usize)>,
     pub stop_button: Option<Rect>,
     pub narrator_button: Option<Rect>,
+    /// The footer's "N in background" chip: opens the background tasks viewer.
+    pub bg_button: Option<Rect>,
     /// Compact mode: (screen row, anchor entry) of expanded groups' header lines.
     pub group_rows: Vec<(u16, usize)>,
     pub total_lines: usize,
@@ -287,6 +295,8 @@ pub struct LayoutInfo {
     pub shortcuts_max: usize,
     /// Settings overlay: (screen row, item index) of each row, for clicks.
     pub settings_rows: Vec<(u16, usize)>,
+    /// Rows of the background tasks list: (screen row, index in `bg_tasks()`).
+    pub bg_rows: Vec<(u16, usize)>,
     /// The open popup (overlay or completion menu), for its fade-in.
     pub popup: Option<Rect>,
 }
@@ -439,6 +449,7 @@ pub const LOCAL_COMMANDS: &[(&str, &str)] = &[
     ("btw", "Ask a side question without interrupting (answered in a fork)"),
     ("queue", "List queued prompts (↑ on an empty prompt edits the last one)"),
     ("tasks", "List running tools, background commands and queued prompts"),
+    ("bg", "Background tasks: list them, follow their output, stop them"),
     ("find", "Search the scrollback"),
     ("rename", "Rename this session"),
     ("stash", "Set the prompt aside, or bring it back"),
@@ -979,6 +990,7 @@ impl App {
                 }
             }
             AppMsg::BtwDone(id, r) => self.on_btw_done(id, r),
+            AppMsg::BgStopped(label, r) => self.on_bg_stopped(label, r),
             AppMsg::TitleSet(r) => {
                 if let Err(e) = r {
                     self.toast(format!("Renamed here only (the agent didn't save it: {})", e.message));
@@ -2390,6 +2402,8 @@ impl App {
                     self.shortcuts_scroll = self.shortcuts_scroll.saturating_sub(3);
                 } else if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
                     *scroll = scroll.saturating_sub(3);
+                } else if let Overlay::Tasks(v) = &mut self.overlay {
+                    v.scroll = (v.scroll + 3).min(self.layout.viewer_max);
                 } else if let Overlay::Picker(p) = &mut self.overlay {
                     p.sel = p.sel.saturating_sub(1);
                     self.picker_preview();
@@ -2402,6 +2416,8 @@ impl App {
                     self.shortcuts_scroll = (self.shortcuts_scroll + 3).min(self.layout.shortcuts_max);
                 } else if let Overlay::Viewer { scroll, .. } = &mut self.overlay {
                     *scroll = (*scroll + 3).min(self.layout.viewer_max);
+                } else if let Overlay::Tasks(v) = &mut self.overlay {
+                    v.scroll = v.scroll.min(self.layout.viewer_max).saturating_sub(3);
                 } else if let Overlay::Picker(p) = &mut self.overlay {
                     let n = p.visible().len();
                     if p.sel + 1 < n {
@@ -2420,6 +2436,12 @@ impl App {
                     }
                     return;
                 }
+                if matches!(self.overlay, Overlay::Tasks(_)) {
+                    if let Some(&(_, i)) = self.layout.bg_rows.iter().find(|(y, _)| *y == m.row) {
+                        self.bg_select_row(i);
+                    }
+                    return;
+                }
                 if !matches!(self.overlay, Overlay::None) {
                     return;
                 }
@@ -2427,6 +2449,12 @@ impl App {
                 if let Some(b) = self.layout.stop_button {
                     if b.contains((x, y).into()) {
                         self.cancel_turn();
+                        return;
+                    }
+                }
+                if let Some(b) = self.layout.bg_button {
+                    if b.contains((x, y).into()) {
+                        self.open_bg_view();
                         return;
                     }
                 }
@@ -2748,6 +2776,10 @@ impl App {
                     }
                     _ => {}
                 }
+                return;
+            }
+            Overlay::Tasks(_) => {
+                self.on_bg_key(&k);
                 return;
             }
             Overlay::Settings { .. } | Overlay::None => {}

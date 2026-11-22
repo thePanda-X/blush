@@ -453,6 +453,41 @@ pub struct Transcript {
     pub skipping_usage: bool,
     /// Reveal streamed text gradually (live turns; not history replays).
     pub animate_stream: bool,
+    /// Background work the adapter reports as async tasks (shells, monitors,
+    /// workflows, turns Claude starts on its own), oldest first.
+    pub bg: Vec<BgTask>,
+    /// Whether the adapter has reported any async task (it does only when
+    /// blush declares the `asyncTasks` capability and the adapter supports it).
+    pub bg_seen: bool,
+}
+
+/// One background task, from `async_task_spawned` / `_progress` / `_state_update`.
+#[derive(Debug, Clone)]
+pub struct BgTask {
+    pub id: String,
+    pub tool_call_id: Option<String>,
+    /// `shell`, `monitor`, `workflow`, `turn`, `task`, ...
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub summary: Option<String>,
+    pub output_file: Option<std::path::PathBuf>,
+    /// `running`, `paused`, `completed`, `failed` or `stopped`.
+    pub state: String,
+    pub can_stop: bool,
+    pub started: Instant,
+    pub ended: Option<Instant>,
+}
+
+impl BgTask {
+    pub fn running(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused")
+    }
+
+    /// How long it ran (or has been running).
+    pub fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
 }
 
 impl Transcript {
@@ -468,6 +503,92 @@ impl Transcript {
             diff_focus: false,
             skipping_usage: false,
             animate_stream: false,
+            bg: vec![],
+            bg_seen: false,
+        }
+    }
+
+    /// The command a background task's tool call ran, if it was a Bash call.
+    pub fn bg_command(&self, task: &BgTask) -> Option<String> {
+        let idx = *self.tool_index.get(task.tool_call_id.as_deref()?)?;
+        let Block::Tool(t) = &self.entries.get(idx)?.block else { return None };
+        t.raw_input.get("command").and_then(|c| c.as_str()).map(str::to_owned)
+    }
+
+    /// One line naming a background task: its description, else its command.
+    pub fn bg_label(&self, task: &BgTask) -> String {
+        let cmd = || self.bg_command(task).map(|c| c.lines().next().unwrap_or("").to_string());
+        if !task.description.trim().is_empty() {
+            task.description.lines().next().unwrap_or("").to_string()
+        } else {
+            cmd().unwrap_or_else(|| task.name.clone())
+        }
+    }
+
+    fn apply_async_task(&mut self, kind: &str, u: &Value) {
+        let id = s(u, "asyncTaskId");
+        if id.is_empty() {
+            return;
+        }
+        self.bg_seen = true;
+        let opt = |k: &str| u.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_owned);
+        let pos = match self.bg.iter().position(|t| t.id == id) {
+            Some(i) => i,
+            None => {
+                self.bg.push(BgTask {
+                    id: id.clone(),
+                    tool_call_id: None,
+                    kind: "task".into(),
+                    name: String::new(),
+                    description: String::new(),
+                    summary: None,
+                    output_file: None,
+                    state: "running".into(),
+                    can_stop: false,
+                    started: Instant::now(),
+                    ended: None,
+                });
+                // Keep the list bounded: drop the oldest finished tasks.
+                while self.bg.len() > 200 {
+                    match self.bg.iter().position(|t| !t.running()) {
+                        Some(i) => self.bg.remove(i),
+                        None => break,
+                    };
+                }
+                self.bg.iter().position(|t| t.id == id).unwrap_or(self.bg.len() - 1)
+            }
+        };
+        let t = &mut self.bg[pos];
+        if kind == "async_task_spawned" {
+            if let Some(v) = opt("taskType") {
+                t.kind = v;
+            }
+            if let Some(v) = opt("name") {
+                t.name = v;
+            }
+            t.can_stop = u.get("canStop").and_then(|v| v.as_bool()).unwrap_or(false);
+        }
+        if let Some(v) = opt("description") {
+            t.description = v;
+        }
+        if let Some(v) = opt("summary") {
+            t.summary = Some(v);
+        }
+        if let Some(v) = opt("outputFilePath") {
+            t.output_file = Some(std::path::PathBuf::from(v));
+        }
+        if let Some(v) = opt("toolCallId") {
+            t.tool_call_id = Some(v);
+        }
+        if kind == "async_task_state_update" {
+            if let Some(v) = opt("state") {
+                t.state = v;
+                if t.running() {
+                    t.ended = None;
+                } else {
+                    t.ended.get_or_insert_with(Instant::now);
+                }
+            }
         }
     }
 
@@ -637,7 +758,16 @@ impl Transcript {
     pub fn apply_update(&mut self, session: &mut Session, u: &Value) -> Effects {
         let mut fx = Effects::default();
         let kind = u.get("sessionUpdate").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(kind, "agent_thought_chunk" | "usage_update" | "available_commands_update" | "session_info_update") {
+        if !matches!(
+            kind,
+            "agent_thought_chunk"
+                | "usage_update"
+                | "available_commands_update"
+                | "session_info_update"
+                | "async_task_spawned"
+                | "async_task_progress"
+                | "async_task_state_update"
+        ) {
             self.last_activity = Instant::now();
         }
         if kind == "user_message_chunk" {
@@ -697,6 +827,9 @@ impl Transcript {
                 if let Some(&idx) = self.tool_index.get(&id) {
                     self.merge_tool(idx, u);
                 }
+            }
+            "async_task_spawned" | "async_task_progress" | "async_task_state_update" => {
+                self.apply_async_task(kind, u);
             }
             "plan" => {
                 let items: Vec<PlanItem> = u

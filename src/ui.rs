@@ -129,6 +129,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Shortcuts => draw_shortcuts(f, app, &th, full, &mut layout),
         Overlay::Viewer { .. } => draw_viewer(f, app, &th, full, &mut layout),
         Overlay::Settings { .. } => draw_settings(f, app, &th, full, &mut layout),
+        Overlay::Tasks(_) => draw_bg_tasks(f, app, &th, full, &mut layout),
     }
     let popup_key = match &app.overlay {
         Overlay::None if layout.popup.is_some() => 1,
@@ -137,6 +138,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Shortcuts => 3,
         Overlay::Viewer { .. } => 4,
         Overlay::Settings { .. } => 5,
+        Overlay::Tasks(_) => 6,
     };
     let alpha = track_popup(&mut app.popup[0], popup_key);
     if let Some(r) = layout.popup {
@@ -300,7 +302,7 @@ fn pane_lines(app: &App, th: &Theme, w: usize) -> Vec<Line<'static>> {
             Span::styled(format!("{DIAMOND} "), th.accent()),
             Span::styled("Tasks", Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
             Span::styled(if rows.is_empty() { String::new() } else { format!("  {}", rows.len()) }, th.muted()),
-            Span::styled("   Ctrl+B hides", th.dim()),
+            Span::styled(if app.transcript.bg_seen { "   Ctrl+B hides · Alt+J output" } else { "   Ctrl+B hides" }, th.dim()),
         ]));
         if rows.is_empty() {
             out.push(Line::from(Span::styled("  nothing running", th.dim())));
@@ -310,7 +312,9 @@ fn pane_lines(app: &App, th: &Theme, w: usize) -> Vec<Line<'static>> {
                 "running" | "subagent" => th.accent,
                 "shell" => th.command,
                 "btw" => th.info,
-                "background" => th.success,
+                "background" | "done" => th.success,
+                "working" | "paused" => th.accent,
+                "failed" | "stopped" => th.error,
                 _ => th.gray,
             };
             let since = r.since.map(|d| format!("  {}", human_duration_short(d))).unwrap_or_default();
@@ -1064,8 +1068,14 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     } else {
         vec![("Shift+Tab", "mode"), ("@", "files"), ("/", "commands"), ("Ctrl+X", "palette"), ("Ctrl+.", "shortcuts")]
     };
-    // Right side: subscription meter, then the narrator toggle.
+    // Right side: background tasks, subscription meter, then the narrator toggle.
     let mut right: Vec<Span> = Vec::new();
+    let bg = app.bg_running();
+    let bg_chip = (bg > 0).then(|| format!("● {bg} in background"));
+    if let Some(chip) = &bg_chip {
+        right.push(Span::styled(chip.clone(), Style::default().fg(th.success)));
+        right.push(Span::styled("   ", th.dim()));
+    }
     let windows = crate::usage::meter_windows(&app.limits);
     if app.config.features.sub_meter && !windows.is_empty() {
         let w = windows[(tick_ms(app.tick) / METER_PERIOD_MS) as usize % windows.len()];
@@ -1099,6 +1109,10 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
     let label_w = crate::text::width(label) as u16;
     if right_w + 10 < r.width {
         layout.narrator_button = Some(Rect { x: r.x + r.width - label_w, y: r.y, width: label_w, height: 1 });
+        if let Some(chip) = &bg_chip {
+            let w = crate::text::width(chip) as u16;
+            layout.bg_button = Some(Rect { x: r.x + r.width - right_w, y: r.y, width: w, height: 1 });
+        }
         f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), r);
     } else {
         right_w = 0;
@@ -1326,6 +1340,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
             ("Ctrl+F", "find in the scrollback"),
             ("F2", "settings"),
             ("Alt+P · Ctrl+B", "todo pane · tasks pane"),
+            ("Alt+J", "background tasks and their output"),
             ("Ctrl+E", "expand / collapse thinking"),
             ("Ctrl+O", "expand / collapse all blocks"),
             ("Ctrl+G", "compact layout: group tools & thinking"),
@@ -1350,6 +1365,7 @@ fn draw_shortcuts(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut
             ("/after <task>", "queue a task for when Claude finishes"),
             ("/btw <question>", "side question, answered in a fork"),
             ("/rename · /queue · /tasks", "name the session · list queue · tasks"),
+            ("/bg", "background tasks: output, stop"),
             ("/density · /timestamps", "tool-call detail · clock display"),
             ("/narrator", "read each turn's summary aloud"),
         ]),
@@ -1466,6 +1482,111 @@ fn draw_viewer(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut La
     f.render_widget(Paragraph::new(vis), inner);
 }
 
+fn draw_bg_tasks(f: &mut Frame, app: &App, th: &Theme, area: Rect, layout: &mut LayoutInfo) {
+    let Overlay::Tasks(v) = &app.overlay else { return };
+    let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
+    f.render_widget(Clear, r);
+    layout.popup = Some(r);
+    let tasks = app.bg_tasks();
+    let running = tasks.iter().filter(|t| t.running()).count();
+    let title = format!("Background tasks · {running} running");
+    let block = modal_block(th, &title)
+        .title_bottom(
+            hint_line(th, &[("↑↓", "task"), ("PgUp/PgDn", "scroll"), ("Enter", "full output"), ("x", "stop"), ("y", "copy"), ("o", "reveal"), ("Esc", "close")])
+                .alignment(Alignment::Right),
+        )
+        .style(th.base());
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    let w = inner.width as usize;
+    if tasks.is_empty() {
+        f.render_widget(Paragraph::new(Line::from(Span::styled("No background tasks in this session", th.dim()))), inner);
+        return;
+    }
+    let sel = v.sel.as_deref().and_then(|id| tasks.iter().position(|t| t.id == id)).unwrap_or(0);
+
+    // The list: at most a third of the height, scrolled to keep the selection in view.
+    let list_h = tasks.len().min((inner.height as usize / 3).max(3)).min(inner.height as usize);
+    let start = sel.saturating_sub(list_h.saturating_sub(1));
+    for (row, (i, t)) in tasks.iter().enumerate().skip(start).take(list_h).enumerate() {
+        let y = inner.y + row as u16;
+        let s = i == sel;
+        let (glyph, color) = match t.state.as_str() {
+            "running" => (anim::frame(BRAILLE, app.tick, 80), th.accent),
+            "paused" => ("Ⅱ", th.warning),
+            "completed" => ("✓", th.success),
+            "stopped" => ("■", th.gray),
+            _ => ("✗", th.error),
+        };
+        let since = human_duration_short(t.elapsed());
+        let room = w.saturating_sub(4 + 10 + 9 + crate::text::width(&since) + 2);
+        let label = truncate(&sanitize(&app.transcript.bg_label(t)), room);
+        let pad = room.saturating_sub(crate::text::width(&label));
+        let mut l = Line::from(vec![
+            Span::styled(if s { "▎" } else { " " }, th.accent()),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(format!("{:<10}", t.state), Style::default().fg(color)),
+            Span::styled(format!("{:<9}", truncate(&t.kind, 8)), th.muted()),
+            Span::styled(
+                format!("{label}{}", " ".repeat(pad)),
+                if s { Style::default().fg(th.text).add_modifier(Modifier::BOLD) } else { Style::default().fg(th.text) },
+            ),
+            Span::styled(format!("  {since}"), th.dim()),
+        ]);
+        if s {
+            l = crate::text::pad_line(l, w, Style::default().bg(th.bg_hover)).style(Style::default().bg(th.bg_hover));
+        }
+        f.render_widget(Paragraph::new(l), Rect { y, height: 1, ..inner });
+        layout.bg_rows.push((y, i));
+    }
+
+    // The selected task: its command, then its output, following the end.
+    let t = tasks[sel];
+    let bottom = inner.y + inner.height;
+    let mut y = inner.y + list_h as u16;
+    let mut head: Vec<Line> = vec![Line::from(Span::styled("─".repeat(w), th.dim()))];
+    if let Some(cmd) = app.transcript.bg_command(t) {
+        head.push(Line::from(vec![
+            Span::styled("$ ", th.accent()),
+            Span::styled(truncate(&sanitize(cmd.lines().next().unwrap_or("")), w.saturating_sub(2)), th.secondary()),
+        ]));
+    }
+    if let Some(sum) = &t.summary {
+        head.push(Line::from(Span::styled(truncate(&sanitize(sum), w), th.muted())));
+    }
+    for l in head {
+        if y >= bottom {
+            return;
+        }
+        f.render_widget(Paragraph::new(l), Rect { y, height: 1, ..inner });
+        y += 1;
+    }
+    let out_area = Rect { y, height: bottom.saturating_sub(y), ..inner };
+    let mut lines: Vec<Line> = Vec::new();
+    let text = sanitize(&v.output);
+    for raw in text.trim_end_matches('\n').split('\n') {
+        lines.extend(crate::text::hard_wrap(vec![Span::styled(raw.to_string(), Style::default().fg(th.text_secondary))], w, vec![]));
+    }
+    if text.trim().is_empty() {
+        lines = vec![Line::from(Span::styled(if t.running() { "no output yet" } else { "no output" }, th.dim()))];
+    }
+    let h = out_area.height as usize;
+    let max = lines.len().saturating_sub(h);
+    layout.viewer_max = max;
+    layout.viewer_page = h;
+    let up = v.scroll.min(max);
+    let vis: Vec<Line> = lines.into_iter().skip(max - up).take(h).collect();
+    f.render_widget(Paragraph::new(vis), out_area);
+    if up > 0 && h > 0 {
+        let more = format!(" ↓ {up} more lines · End follows ");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(more, th.muted())).alignment(Alignment::Right)),
+            Rect { y: out_area.y + out_area.height - 1, height: 1, ..out_area },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,6 +1604,34 @@ mod tests {
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn background_tasks_viewer_lists_tasks_and_shows_output() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), std::env::temp_dir(), tx, SessionKind::New);
+        let mut s = crate::model::Session::default();
+        let out = std::env::temp_dir().join(format!("blush-ui-bg-{}.output", std::process::id()));
+        std::fs::write(&out, "server listening on :3000
+").unwrap();
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"dev","kind":"execute",
+            "status":"completed","rawInput":{"command":"npm run dev","run_in_background":true}}));
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"b1","name":"Shell",
+            "taskType":"shell","description":"Start dev server","showInTranscript":true,"canStop":true,"toolCallId":"t1",
+            "outputFilePath": out.to_string_lossy()}));
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"b2","name":"Shell",
+            "taskType":"shell","description":"Run tests","showInTranscript":true,"canStop":true}));
+        app.transcript.apply_update(&mut s, &json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"b2","state":"failed"}));
+        let footer = screen(&mut app, 120, 30);
+        assert!(footer.contains("1 in background"), "{footer}");
+        app.open_bg_view();
+        let txt = screen(&mut app, 120, 30);
+        let _ = std::fs::remove_file(&out);
+        assert!(txt.contains("Background tasks · 1 running"), "{txt}");
+        assert!(txt.contains("Start dev server"), "{txt}");
+        assert!(txt.contains("Run tests"), "{txt}");
+        assert!(txt.contains("$ npm run dev"), "{txt}");
+        assert!(txt.contains("server listening on :3000"), "{txt}");
     }
 
     #[test]

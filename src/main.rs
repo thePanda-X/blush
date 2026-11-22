@@ -370,6 +370,9 @@ async fn run_tui(
                     if app.reveal_stream() {
                         app.dirty = true;
                     }
+                    if app.poll_bg_view() {
+                        app.dirty = true;
+                    }
                     if app.animating() || toast_live || meter_flip || app.poll_narrator() {
                         app.dirty = true;
                     }

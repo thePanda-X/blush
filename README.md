@@ -205,6 +205,7 @@ share = true         # share running TUI sessions while the server is up
 | `Ctrl+X` · `?` in the scrollback | Command palette: every command, fuzzy-searchable, with its shortcut |
 | `F2` | Settings |
 | `Alt+P` · `Ctrl+B` | Toggle the todo pane · the tasks pane |
+| `Alt+J` | Background tasks: follow their output, stop them |
 | `Shift+←` / `Shift+→` | Jump between turns |
 | `Ctrl+E` / `Ctrl+O` | Toggle thinking blocks / toggle all blocks (and, in compact mode, all groups) |
 | `Ctrl+G` | Toggle the compact layout |
@@ -253,6 +254,7 @@ share = true         # share running TUI sessions while the server is up
 | `/find [text]` | Find in the scrollback (`Ctrl+F`) |
 | `/queue` · `/tasks` | List queued prompts · list running tools, background commands, and queued work |
 | `/stash` | Stash the prompt, or bring it back (`Ctrl+S`) |
+| `/bg` | Background tasks Claude started: live output, stop (`Alt+J`) |
 | `/todos` · `/tasks-pane` | Toggle the todo pane (`Alt+P`) · the tasks pane (`Ctrl+B`) |
 | `/narrator` | Turn spoken turn summaries on or off |
 | `/compact-mode` | Toggle the compact layout (same as `Ctrl+G`) |
@@ -409,9 +411,25 @@ opens a chooser.
 - The **todo pane** pins Claude's todo list above the prompt while it has open items. You see
   the item in progress and its neighbours, plus a done count. `Alt+P` hides it.
 - The **tasks pane** (`Ctrl+B`, off by default) lists what's in flight: running tool calls and
-  subagents, `!` commands, `/btw` questions, queued prompts, and the last few commands Claude
-  started in the background. Claude Code doesn't tell clients when a background command ends, so
-  those show when they started, not whether they're still running.
+  subagents, `!` commands, `/btw` questions, queued prompts, and the commands Claude runs in the
+  background, until they end.
+
+### Background tasks
+
+When Claude runs a command in the background (a dev server, a long test run, a `Monitor`), the
+adapter reports when it starts and ends. While any run, the footer shows **● N in background**.
+Click it, press `Alt+J`, or type `/bg` to open the background tasks viewer:
+
+- The list shows every background task in the session, running first, with its state and how
+  long it ran.
+- Below it, the selected task's command and the end of its output, updated live as the command
+  writes. `PgUp`/`PgDn` scroll back, `End` follows again.
+- `Enter` opens the full output in the viewer, `y` copies it, `o` shows the output file in your
+  file manager, and `x` stops the task.
+
+This uses the adapter's async task extension, which blush asks for when it connects. With an
+older adapter that lacks it, the tasks pane falls back to listing the last few background
+commands without knowing when they end.
 
 ### Notifications
 

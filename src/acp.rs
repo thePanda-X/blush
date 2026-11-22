@@ -310,7 +310,11 @@ pub fn initialize_params() -> Value {
         "clientCapabilities": {
             "fs": { "readTextFile": false, "writeTextFile": false },
             "terminal": false,
-            "elicitation": { "form": {} }
+            "elicitation": { "form": {} },
+            // The adapter's async-task extension (JetBrains AIR namespace):
+            // background shells and other tasks report their lifecycle, so
+            // blush can list them, follow their output and stop them.
+            "_meta": { "jetbrains": { "air": { "version": 1, "capabilities": ["asyncTasks"] } } }
         },
         "clientInfo": { "name": "blush", "title": "blush", "version": env!("CARGO_PKG_VERSION") }
     })

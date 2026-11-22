@@ -136,6 +136,7 @@ fn shortcut_for(name: &str) -> &'static str {
         "stash" => "Ctrl+S",
         "todos" => "Alt+P",
         "tasks-pane" => "Ctrl+B",
+        "bg" => "Alt+J",
         "settings" => "F2",
         "shortcuts" => "Ctrl+.",
         _ => "",
@@ -251,6 +252,7 @@ impl App {
             }
             "todos" => self.toggle_pane(true),
             "tasks-pane" => self.toggle_pane(false),
+            "bg" => self.open_bg_view(),
             _ => {}
         }
     }
@@ -334,6 +336,7 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') if ctrl && !alt => self.stash_toggle(),
             KeyCode::Char('v') | KeyCode::Char('V') if ctrl && !alt => self.paste_clipboard(),
             KeyCode::Char('p') if alt && !ctrl => self.toggle_pane(true),
+            KeyCode::Char('j') | KeyCode::Char('J') if alt && !ctrl => self.open_bg_view(),
             KeyCode::Char('v') if alt && !ctrl => self.paste_image(),
             _ => return false,
         }
@@ -976,13 +979,37 @@ impl App {
             if e.is_live() {
                 let kind = if t.kind == "think" { "subagent" } else { "running" };
                 rows.push(TaskRow { kind, label: label(), since: Some(t.started.elapsed()) });
-            } else if t.raw_input.get("run_in_background").and_then(|v| v.as_bool()) == Some(true) && t.status == ToolStatus::Done {
+            } else if !self.transcript.bg_seen
+                && t.raw_input.get("run_in_background").and_then(|v| v.as_bool()) == Some(true)
+                && t.status == ToolStatus::Done
+            {
                 background.push(TaskRow { kind: "background", label: label(), since: Some(t.started.elapsed()) });
             }
         }
-        // Claude doesn't report when background commands end: show the latest few.
-        let skip = background.len().saturating_sub(3);
-        rows.extend(background.into_iter().skip(skip));
+        if self.transcript.bg_seen {
+            // The adapter reports each background task's end: list the running
+            // ones, and the ones that ended in the last few seconds.
+            for b in &self.transcript.bg {
+                let recent = b.ended.is_some_and(|e| e.elapsed() < Duration::from_secs(8));
+                if !b.running() && !recent {
+                    continue;
+                }
+                let kind = match (b.kind.as_str(), b.state.as_str()) {
+                    ("turn", _) => "working",
+                    (_, "running") => "background",
+                    (_, "paused") => "paused",
+                    (_, "completed") => "done",
+                    (_, "stopped") => "stopped",
+                    _ => "failed",
+                };
+                rows.push(TaskRow { kind, label: self.transcript.bg_label(b), since: Some(b.elapsed()) });
+            }
+        } else {
+            // An adapter without async tasks doesn't report when background
+            // commands end: show the latest few.
+            let skip = background.len().saturating_sub(3);
+            rows.extend(background.into_iter().skip(skip));
+        }
         if let Some(run) = &self.shell {
             rows.push(TaskRow { kind: "shell", label: format!("! {}", run.cmd), since: Some(run.started.elapsed()) });
         }
@@ -1018,7 +1045,7 @@ impl App {
             SettingsItem { key: "thinking", label: "Show thinking", value: onoff(self.transcript.show_thinking), hint: "Alt+H" },
             SettingsItem { key: "expand_thinking", label: "Expand thinking", value: onoff(ui.expand_thinking), hint: "new thinking blocks start open" },
             SettingsItem { key: "todo_pane", label: "Todo pane", value: onoff(ui.todo_pane), hint: "Alt+P · Claude's todo list, pinned" },
-            SettingsItem { key: "tasks_pane", label: "Tasks pane", value: onoff(ui.tasks_pane), hint: "Ctrl+B · running and queued work" },
+            SettingsItem { key: "tasks_pane", label: "Tasks pane", value: onoff(ui.tasks_pane), hint: "Ctrl+B · running and queued work · Alt+J background output" },
             SettingsItem { key: "notify", label: "Notifications", value: onoff(f.notify), hint: "chime when Claude needs you or finishes" },
             SettingsItem { key: "narrator", label: "Narrator", value: onoff(f.narrator), hint: "read each turn's summary aloud" },
             SettingsItem { key: "sub_meter", label: "Subscription meter", value: onoff(f.sub_meter), hint: "5-hour and weekly limits" },
