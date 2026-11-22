@@ -390,7 +390,10 @@ impl<'t> Renderer<'t> {
                 }
             }
             Event::Code(t) => {
-                let s = Style::default().fg(self.theme.code_inline);
+                let mut s = Style::default().fg(self.theme.code_inline);
+                if self.link.is_some() {
+                    s = s.add_modifier(Modifier::UNDERLINED);
+                }
                 self.spans.push(Span::styled(sanitize(&t), s));
             }
             Event::SoftBreak => {

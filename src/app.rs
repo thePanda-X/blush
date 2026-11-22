@@ -282,6 +282,8 @@ pub struct LayoutInfo {
     pub narrator_button: Option<Rect>,
     /// The footer's "N in background" chip: opens the background tasks viewer.
     pub bg_button: Option<Rect>,
+    /// Clickable links on screen: (row, x start, x end exclusive, url).
+    pub links: Vec<(u16, u16, u16, String)>,
     /// Compact mode: (screen row, anchor entry) of expanded groups' header lines.
     pub group_rows: Vec<(u16, usize)>,
     pub total_lines: usize,
@@ -2466,6 +2468,14 @@ impl App {
                 }
                 if self.layout.prompt_area.contains((x, y).into()) {
                     self.focus = Focus::Prompt;
+                    return;
+                }
+                if let Some((_, _, _, url)) = self.layout.links.iter().find(|(ly, x0, x1, _)| *ly == y && x >= *x0 && x < *x1) {
+                    let url = url.clone();
+                    match crate::links::open(&url) {
+                        Ok(()) => self.toast(format!("Opening {}", crate::text::truncate(&url, 60))),
+                        Err(e) => self.toast(format!("Couldn't open link: {e}")),
+                    }
                     return;
                 }
                 if let Some(&(_, anchor)) = self.layout.group_rows.iter().find(|(gy, _)| *gy == y) {

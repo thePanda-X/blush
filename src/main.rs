@@ -8,6 +8,7 @@ mod files;
 mod headless;
 mod input;
 mod launcher;
+mod links;
 mod markdown;
 mod model;
 mod narrator;

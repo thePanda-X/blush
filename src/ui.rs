@@ -503,6 +503,18 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             continue;
         }
         layout.entry_rows.push((sy0, sy1, *idx, *hdr, first_vis - start));
+        let md = match &entry.block {
+            Block::Agent { text } if !entry.raw => Some(entry.visible(text)),
+            Block::Aside { answer, .. } => Some(answer.trim()),
+            _ => None,
+        };
+        for (li, x0, x1, url) in crate::links::scan(lines, md) {
+            let row = start + li;
+            if row >= first_vis && row < last_vis && x0 < content_w {
+                let sy = r.y + (row - top) as u16;
+                layout.links.push((sy, cx + x0, cx + x1.min(content_w), url));
+            }
+        }
         for row in first_vis..last_vis {
             let sy = r.y + (row - top) as u16;
             let li = row - start;
