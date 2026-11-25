@@ -284,8 +284,10 @@ pub struct LayoutInfo {
     pub bg_button: Option<Rect>,
     /// Clickable links on screen: (row, x start, x end exclusive, url).
     pub links: Vec<(u16, u16, u16, String)>,
-    /// Code blocks' copy buttons: (row, x start, x end exclusive, code).
-    pub code_copy: Vec<(u16, u16, u16, String)>,
+    /// Code blocks' copy buttons: (row, x start, x end exclusive, entry, block).
+    pub code_copy: Vec<(u16, u16, u16, usize, usize)>,
+    /// Code blocks on screen: (visible rect, entry, block).
+    pub code_blocks: Vec<(Rect, usize, usize)>,
     /// Compact mode: (screen row, anchor entry) of expanded groups' header lines.
     pub group_rows: Vec<(u16, usize)>,
     pub total_lines: usize,
@@ -361,6 +363,11 @@ pub struct App {
     pub turns_done: usize,
 
     pub selected: Option<usize>,
+    /// A code block selected within the selected response: (entry, block).
+    /// Only counts while that entry is still the selected one.
+    pub selected_code: Option<(usize, usize)>,
+    /// The code block copied last, for its check animation: (entry, block, when).
+    pub code_copied: Option<(usize, usize, Instant)>,
     /// Lines scrolled up from the bottom.
     pub scroll: usize,
     pub follow: bool,
@@ -530,6 +537,8 @@ impl App {
             session_tokens: Tokens::default(),
             turns_done: 0,
             selected: None,
+            selected_code: None,
+            code_copied: None,
             scroll: 0,
             follow: true,
             tick: 0,
@@ -597,6 +606,7 @@ impl App {
                     || e.settling().is_some()
                     || e.unfolded_at.get().is_some_and(|t| t.elapsed() < crate::ui::UNFOLD)
             })
+            || self.code_copied.is_some_and(|(_, _, at)| at.elapsed() < crate::ui::COPY_FLASH)
             || self.tweens.busy()
             || (self.scroll_shown - self.scroll as f32).abs() > 0.01
             || self.popup.iter().any(|(k, at)| *k != 0 && at.elapsed() < crate::ui::POPUP_FADE)
@@ -2472,9 +2482,9 @@ impl App {
                     self.focus = Focus::Prompt;
                     return;
                 }
-                if let Some((_, _, _, code)) = self.layout.code_copy.iter().find(|(cy, x0, x1, _)| *cy == y && x >= *x0 && x < *x1) {
-                    let code = code.clone();
-                    self.copy(&code);
+                if let Some(&(_, _, _, idx, k)) = self.layout.code_copy.iter().find(|(cy, x0, x1, _, _)| *cy == y && x >= *x0 && x < *x1) {
+                    self.select_code(idx, k);
+                    self.copy_code(idx, k);
                     return;
                 }
                 if let Some((_, _, _, url)) = self.layout.links.iter().find(|(ly, x0, x1, _)| *ly == y && x >= *x0 && x < *x1) {
@@ -2494,8 +2504,14 @@ impl App {
                     }
                 }
                 if self.layout.scroll_area.contains((x, y).into()) {
+                    if let Some(&(_, idx, k)) = self.layout.code_blocks.iter().find(|(r, _, _)| r.contains((x, y).into())) {
+                        self.select_code(idx, k);
+                        return;
+                    }
                     let hit = self.layout.entry_rows.iter().find(|(y0, y1, _, _, _)| y >= *y0 && y < *y1).cloned();
                     if let Some((y0, _, idx, header_rows, first_row)) = hit {
+                        // A click outside any code block selects the whole response.
+                        self.selected_code = None;
                         let already = self.selected == Some(idx);
                         self.selected = Some(idx);
                         self.focus = Focus::Scrollback;
@@ -2597,6 +2613,28 @@ impl App {
     }
 
     /// Plain text of a selection; a collapsed group yields all its members.
+    /// The selected code block's index within the selected entry, if any.
+    pub fn selected_code_block(&self) -> Option<usize> {
+        self.selected_code
+            .filter(|(e, _)| self.selected == Some(*e) && self.focus == Focus::Scrollback)
+            .map(|(_, k)| k)
+    }
+
+    fn select_code(&mut self, idx: usize, k: usize) {
+        self.selected = Some(idx);
+        self.selected_code = Some((idx, k));
+        self.focus = Focus::Scrollback;
+    }
+
+    /// Copy code block `k` of entry `idx` and play its check animation.
+    fn copy_code(&mut self, idx: usize, k: usize) {
+        let code = self.transcript.entries.get(idx).and_then(|e| e.markdown()).and_then(|md| crate::markdown::code_blocks(md).into_iter().nth(k));
+        if let Some((_, code)) = code {
+            self.copy(&code);
+            self.code_copied = Some((idx, k, Instant::now()));
+        }
+    }
+
     fn selection_text(&self, idx: usize) -> String {
         match self.group_of(idx).filter(|_| self.is_collapsed_group(idx)) {
             Some(g) => self.transcript.group_members(g).iter().map(|e| e.plain_text()).collect::<Vec<_>>().join("\n\n"),
@@ -2986,6 +3024,21 @@ impl App {
                 return;
             }
             _ => {}
+        }
+        if let Some(block) = self.selected_code_block() {
+            match k.code {
+                KeyCode::Char('y') => {
+                    let idx = self.selected.unwrap_or_default();
+                    self.copy_code(idx, block);
+                    return;
+                }
+                // Back out of the code block to the whole response.
+                KeyCode::Esc => {
+                    self.selected_code = None;
+                    return;
+                }
+                _ => self.selected_code = None,
+            }
         }
         match k.code {
             KeyCode::Esc | KeyCode::Tab | KeyCode::Char(' ') | KeyCode::Char('i') => {

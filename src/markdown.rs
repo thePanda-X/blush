@@ -560,11 +560,21 @@ pub fn code_blocks(md: &str) -> Vec<(String, String)> {
     out
 }
 
-/// First line of each code block in lines from [`render`]: code rows are the
+/// The rows of each code block in lines from [`render`]: code rows are the
 /// ones that end on the code background `bg`, and blocks are never adjacent.
-pub fn code_block_starts(lines: &[Line], bg: Color) -> Vec<usize> {
+pub fn code_block_rows(lines: &[Line], bg: Color) -> Vec<std::ops::Range<usize>> {
     let is_code = |l: &Line| l.spans.last().is_some_and(|s| s.style.bg == Some(bg));
-    (0..lines.len()).filter(|&i| is_code(&lines[i]) && (i == 0 || !is_code(&lines[i - 1]))).collect()
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !is_code(l) {
+            continue;
+        }
+        match out.last_mut() {
+            Some(r) if r.end == i => r.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
 }
 
 pub fn render(md: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -651,8 +661,9 @@ mod tests {
         let t = Theme::blush();
         let md = "Intro.\n\n```rust\nfn a() {}\nfn b() {}\n```\n\n- item\n\n  ```\n  echo hi\n  ```\n\n```py\nprint(1)";
         let lines = render(md, 40, &t);
-        let starts = code_block_starts(&lines, t.bg_raised);
-        assert_eq!(starts.len(), 3, "{:?}", plain(&lines));
+        let rows = code_block_rows(&lines, t.bg_raised);
+        assert_eq!(rows.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![2, 1, 1], "{:?}", plain(&lines));
+        let starts: Vec<usize> = rows.iter().map(|r| r.start).collect();
         assert_eq!(
             code_blocks(md),
             vec![

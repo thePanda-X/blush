@@ -1220,6 +1220,46 @@ mod tests {
             .join("\n")
     }
 
+    fn click(x: u16, y: u16) -> Event {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE })
+    }
+
+    #[tokio::test]
+    async fn clicking_a_code_block_selects_it_and_y_copies_it() {
+        let (mut app, _rx) = app();
+        app.transcript.entries.clear();
+        app.transcript.push(crate::model::Block::Agent { text: "Try this:\n\n```sh\necho one\necho two\n```\n\nThat's it.".into() });
+        let idx = app.transcript.entries.len() - 1;
+        screen(&mut app, 80, 20);
+        let (r, e, k) = app.layout.code_blocks[0];
+        assert_eq!((e, k), (idx, 0));
+
+        // Inside the block: the block is selected, not just the response.
+        app.on_event(click(r.x + 2, r.y + 1)).await;
+        assert_eq!(app.selected, Some(idx));
+        assert_eq!(app.selected_code_block(), Some(0));
+        let out = screen(&mut app, 80, 20);
+        assert!(out.contains("Esc:whole response"), "{out}");
+
+        // y copies the block, and its button turns into a check.
+        app.on_event(key(KeyCode::Char('y'), KeyModifiers::NONE)).await;
+        assert!(app.code_copied.is_some_and(|(e, k, _)| (e, k) == (idx, 0)));
+        let out = screen(&mut app, 80, 20);
+        assert!(out.contains('✓'), "{out}");
+
+        // Esc backs out to the whole response.
+        app.on_event(key(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert_eq!((app.selected, app.selected_code_block()), (Some(idx), None));
+
+        // A click on the response's prose selects the response.
+        app.on_event(click(r.x + 2, r.y + 1)).await;
+        assert_eq!(app.selected_code_block(), Some(0));
+        let prose = app.layout.entry_rows.iter().find(|row| row.2 == idx).unwrap().0;
+        app.on_event(click(r.x + 2, prose)).await;
+        assert_eq!((app.selected, app.selected_code_block()), (Some(idx), None));
+    }
+
     #[tokio::test]
     async fn web_qr_notice_renders_intact() {
         let (mut app, _rx) = app();

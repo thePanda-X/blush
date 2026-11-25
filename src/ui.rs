@@ -503,10 +503,12 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             continue;
         }
         layout.entry_rows.push((sy0, sy1, *idx, *hdr, first_vis - start));
-        let md = match &entry.block {
-            Block::Agent { text } if !entry.raw => Some(entry.visible(text)),
-            Block::Aside { answer, .. } => Some(answer.trim()),
-            _ => None,
+        let md = entry.markdown();
+        // A selected code block takes the selection bar from its response.
+        let code_sel = app.selected_code_block().filter(|_| app.selected == Some(*idx));
+        let code_rows = match md {
+            Some(_) => crate::markdown::code_block_rows(lines, th.bg_raised),
+            None => Vec::new(),
         };
         for (li, x0, x1, url) in crate::links::scan(lines, md) {
             let row = start + li;
@@ -525,21 +527,52 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
             let line = &lines[li];
             buf.set_line(cx, sy, line, content_w);
             // Rail
-            let rail = rail_for(entry, selected, th, tick, li as u16);
+            let rail = rail_for(entry, selected && code_sel.is_none(), th, tick, li as u16);
             if let Some((g, st)) = rail {
                 buf.set_string(x0, sy, g, st);
             }
         }
         if let Some(md) = md {
-            let starts = crate::markdown::code_block_starts(lines, th.bg_raised);
-            for (li, (lang, code)) in starts.into_iter().zip(crate::markdown::code_blocks(md)) {
-                let row = start + li;
-                if row < first_vis || row >= last_vis {
+            for (k, (rows, (lang, _))) in code_rows.iter().zip(crate::markdown::code_blocks(md)).enumerate() {
+                let (r0, r1) = ((start + rows.start).max(first_vis), (start + rows.end).min(last_vis));
+                if r0 >= r1 {
                     continue;
                 }
-                let sy = r.y + (row - top) as u16;
-                if let Some(b) = draw_copy_button(buf, th, &lines[li], &lang, cx, sy, content_w) {
-                    layout.code_copy.push((sy, b.0, b.1, code));
+                let is_sel = code_sel == Some(k);
+                // Copied just now: a green wash over the block that fades out.
+                let flash = app
+                    .code_copied
+                    .filter(|(e, b, at)| *e == *idx && *b == k && at.elapsed() < COPY_FLASH)
+                    .map(|(_, _, at)| anim::progress(at, COPY_FLASH));
+                let block_w = lines[rows.start..rows.end].iter().map(|l| line_width(l) as u16).max().unwrap_or(0).min(content_w);
+                let rest = if is_sel { th.bg_hover } else { th.bg_raised };
+                let tint = match flash {
+                    Some(p) => blend(rest, th.success, 0.3 * (1.0 - ease_out(p))),
+                    None => rest,
+                };
+                for row in r0..r1 {
+                    let sy = r.y + (row - top) as u16;
+                    if tint != th.bg_raised {
+                        for x in cx..cx + block_w {
+                            if let Some(c) = buf.cell_mut((x, sy)) {
+                                if c.bg == th.bg_raised {
+                                    c.set_bg(tint);
+                                }
+                            }
+                        }
+                    }
+                    if is_sel {
+                        buf.set_string(x0, sy, SELECT_BAR, Style::default().fg(th.accent));
+                    }
+                }
+                let y0 = r.y + (r0 - top) as u16;
+                layout.code_blocks.push((Rect { x: cx, y: y0, width: block_w, height: (r1 - r0) as u16 }, *idx, k));
+                let first = start + rows.start;
+                if first >= first_vis && first < last_vis {
+                    let look = CopyLook { bg: tint, selected: is_sel, flash };
+                    if let Some(b) = draw_copy_button(buf, th, &lines[rows.start], &lang, cx, y0, content_w, look) {
+                        layout.code_copy.push((y0, b.0, b.1, *idx, k));
+                    }
                 }
             }
         }
@@ -590,29 +623,62 @@ fn unroll(e: &Entry, lines: Rc<Vec<Line<'static>>>, hdr: usize) -> Rc<Vec<Line<'
     if keep >= lines.len() { lines } else { Rc::new(lines[..keep].to_vec()) }
 }
 
-/// Draw a code block's "copy" button on its first row `line`, already drawn at
+/// How long a copied code block's check and green wash last.
+pub const COPY_FLASH: Duration = Duration::from_millis(1100);
+
+/// How a code block's copy button looks this frame.
+#[derive(Clone, Copy)]
+struct CopyLook {
+    /// The block's background right now (raised, hovered or flashing).
+    bg: ratatui::style::Color,
+    selected: bool,
+    /// Progress through the copied animation, if it's playing.
+    flash: Option<f32>,
+}
+
+/// Draw a code block's copy button on its first row `line`, already drawn at
 /// (`cx`, `sy`): inside the block left of the language label when that spot is
-/// blank, else just right of the block. Returns the button's columns.
-fn draw_copy_button(buf: &mut Buffer, th: &Theme, line: &Line, lang: &str, cx: u16, sy: u16, content_w: u16) -> Option<(u16, u16)> {
-    const LABEL: &str = "copy";
-    let w = LABEL.len() as u16;
+/// blank, else just right of the block. Just after a copy it turns into a
+/// check that pops in and settles back. Returns the button's columns.
+#[allow(clippy::too_many_arguments)]
+fn draw_copy_button(buf: &mut Buffer, th: &Theme, line: &Line, lang: &str, cx: u16, sy: u16, content_w: u16, look: CopyLook) -> Option<(u16, u16)> {
     let line_w = (line_width(line) as u16).min(content_w);
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let lang_w = crate::text::width(lang) as u16;
     // The renderer puts the language label one column in from the block's right edge.
     let has_label = lang_w > 0 && text.trim_end().ends_with(lang);
     let end = if has_label { line_w.saturating_sub(1 + lang_w + 2) } else { line_w.saturating_sub(1) };
-    let x0 = end.saturating_sub(w);
-    let blank = end >= w + 1
-        && (x0 - 1..end).all(|x| buf.cell((cx + x, sy)).is_some_and(|c| c.symbol() == " "));
-    let (x0, style) = if blank {
-        (x0, Style::default().fg(th.gray).bg(th.bg_raised))
-    } else if line_w + 1 + w <= content_w {
-        (line_w + 1, Style::default().fg(th.gray))
-    } else {
-        return None;
+    let fits_inside = |w: u16| end > w && (end - w - 1..end).all(|x| buf.cell((cx + x, sy)).is_some_and(|c| c.symbol() == " "));
+    let fits_outside = |w: u16| line_w + 1 + w <= content_w;
+    // The check pops in alone, then says "copied".
+    let labels: &[&str] = match look.flash {
+        Some(p) if p < 0.12 => &["✓"],
+        Some(_) => &["✓ copied", "✓"],
+        None => &["copy"],
     };
-    buf.set_string(cx + x0, sy, LABEL, style);
+    let (label, x0, inside) = labels.iter().find_map(|l| {
+        let w = crate::text::width(l) as u16;
+        if fits_inside(w) {
+            Some((*l, end - w, true))
+        } else if fits_outside(w) {
+            Some((*l, line_w + 1, false))
+        } else {
+            None
+        }
+    })?;
+    let mut style = match look.flash {
+        Some(p) => {
+            let s = Style::default().fg(blend(th.success, th.gray, (p - 0.6).max(0.0) / 0.4));
+            if p < 0.35 { s.add_modifier(Modifier::BOLD) } else { s }
+        }
+        None if look.selected => Style::default().fg(th.accent),
+        None => Style::default().fg(th.gray),
+    };
+    if inside {
+        style = style.bg(look.bg);
+    }
+    buf.set_string(cx + x0, sy, label, style);
+    let w = crate::text::width(label) as u16;
     Some((cx + x0, cx + x0 + w))
 }
 
@@ -1104,6 +1170,8 @@ fn draw_footer(f: &mut Frame, app: &App, th: &Theme, r: Rect, layout: &mut Layou
         v
     } else if app.completion.is_some() {
         vec![("↑↓", "select"), ("Tab", "complete"), ("Enter", "accept"), ("Esc", "close")]
+    } else if app.selected_code_block().is_some() {
+        vec![("y", "copy code"), ("Esc", "whole response"), ("↑↓", "select"), ("Tab", "prompt")]
     } else if app.focus == Focus::Scrollback && app.selected_path().is_some() {
         vec![("o", "open"), ("r", "reveal"), ("Enter", "view"), ("y", "copy"), ("Tab", "prompt")]
     } else if app.focus == Focus::Scrollback {
@@ -1648,13 +1716,15 @@ mod tests {
     fn copy_button_sits_beside_the_language_label() {
         let th = Theme::blush();
         let row = |buf: &Buffer| (0..40).map(|x| buf.cell((x, 0)).unwrap().symbol().to_string()).collect::<String>();
-        let draw = |md: &str, lang: &str| {
+        let draw_at = |md: &str, lang: &str, flash: Option<f32>| {
             let lines = crate::markdown::render(md, 30, &th);
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 1));
             buf.set_line(0, 0, &lines[0], 40);
-            let hit = draw_copy_button(&mut buf, &th, &lines[0], lang, 0, 0, 40);
+            let look = CopyLook { bg: th.bg_raised, selected: false, flash };
+            let hit = draw_copy_button(&mut buf, &th, &lines[0], lang, 0, 0, 40, look);
             (row(&buf), hit)
         };
+        let draw = |md: &str, lang: &str| draw_at(md, lang, None);
         let (text, hit) = draw("```rust\nfn main() {}\n```", "rust");
         assert_eq!(text.trim_end(), " fn main() {}      copy  rust", "{text:?}");
         assert_eq!(hit, Some((19, 23)));
@@ -1662,6 +1732,11 @@ mod tests {
         let (text, hit) = draw("```\nlet a_very_long_line = 1234567890;\n```", "");
         assert_eq!(hit, Some((31, 35)), "{text:?}");
         assert_eq!(&text[31..35], "copy", "{text:?}");
+        // Just copied: a lone check pops in, then it reads "✓ copied", ending where "copy" did.
+        let (text, _) = draw_at("```rust\nfn main() {}\n```", "rust", Some(0.05));
+        assert_eq!(text.trim_end(), " fn main() {}         ✓  rust", "{text:?}");
+        let (text, _) = draw_at("```rust\nfn main() {}\n```", "rust", Some(0.5));
+        assert_eq!(text.trim_end(), " fn main() {}  ✓ copied  rust", "{text:?}");
     }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

@@ -165,6 +165,16 @@ impl Entry {
         }
     }
 
+    /// The markdown this entry renders, if it renders markdown (Claude's
+    /// replies and /btw answers): what code blocks and links are found in.
+    pub fn markdown(&self) -> Option<&str> {
+        match &self.block {
+            Block::Agent { text } if !self.raw => Some(self.visible(text)),
+            Block::Aside { answer, .. } => Some(answer.trim()),
+            _ => None,
+        }
+    }
+
     pub fn is_live(&self) -> bool {
         match &self.block {
             Block::Thought { ended, .. } => ended.is_none(),
