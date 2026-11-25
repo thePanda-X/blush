@@ -521,6 +521,52 @@ impl<'t> Renderer<'t> {
     }
 }
 
+/// Close an unterminated fence while streaming so the partial block still renders as code.
+fn close_fence(md: &str) -> std::borrow::Cow<'_, str> {
+    let fences = md.lines().filter(|l| l.trim_start().starts_with("```")).count();
+    if fences % 2 == 1 { format!("{md}\n```").into() } else { md.into() }
+}
+
+/// The code blocks in `md`, in order: (language, code without the final newline).
+pub fn code_blocks(md: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    for ev in Parser::new_ext(&close_fence(md), opts) {
+        match ev {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let lang = match kind {
+                    CodeBlockKind::Fenced(l) => l.split_whitespace().next().unwrap_or("").to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                cur = Some((lang, String::new()));
+            }
+            Event::Text(t) => {
+                if let Some((_, code)) = cur.as_mut() {
+                    code.push_str(&t);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, mut code)) = cur.take() {
+                    if code.ends_with('\n') {
+                        code.pop();
+                    }
+                    out.push((lang, code));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// First line of each code block in lines from [`render`]: code rows are the
+/// ones that end on the code background `bg`, and blocks are never adjacent.
+pub fn code_block_starts(lines: &[Line], bg: Color) -> Vec<usize> {
+    let is_code = |l: &Line| l.spans.last().is_some_and(|s| s.style.bg == Some(bg));
+    (0..lines.len()).filter(|&i| is_code(&lines[i]) && (i == 0 || !is_code(&lines[i - 1]))).collect()
+}
+
 pub fn render(md: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let width = width.max(8);
     let mut opts = Options::empty();
@@ -543,16 +589,7 @@ pub fn render(md: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         table: None,
         pending_blank: false,
     };
-    // Close an unterminated fence while streaming so the partial block still renders as code.
-    let fences = md.lines().filter(|l| l.trim_start().starts_with("```")).count();
-    let owned;
-    let src = if fences % 2 == 1 {
-        owned = format!("{md}\n```");
-        owned.as_str()
-    } else {
-        md
-    };
-    for ev in Parser::new_ext(src, opts) {
+    for ev in Parser::new_ext(&close_fence(md), opts) {
         r.handle(ev);
     }
     if let Some(t) = r.table.take() {
@@ -607,6 +644,25 @@ mod tests {
         let out = render("```rust\nfn main() {}\n```", 30, &t);
         assert_eq!(out.len(), 1);
         assert!(plain(&out)[0].contains("fn main() {}"));
+    }
+
+    #[test]
+    fn finds_code_blocks_in_rendered_lines() {
+        let t = Theme::blush();
+        let md = "Intro.\n\n```rust\nfn a() {}\nfn b() {}\n```\n\n- item\n\n  ```\n  echo hi\n  ```\n\n```py\nprint(1)";
+        let lines = render(md, 40, &t);
+        let starts = code_block_starts(&lines, t.bg_raised);
+        assert_eq!(starts.len(), 3, "{:?}", plain(&lines));
+        assert_eq!(
+            code_blocks(md),
+            vec![
+                ("rust".to_string(), "fn a() {}\nfn b() {}".to_string()),
+                (String::new(), "echo hi".to_string()),
+                ("py".to_string(), "print(1)".to_string()),
+            ]
+        );
+        assert!(plain(&lines)[starts[0]].contains("fn a() {}"));
+        assert!(plain(&lines)[starts[1]].contains("echo hi"));
     }
 
     #[test]

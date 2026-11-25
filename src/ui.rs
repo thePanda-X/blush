@@ -530,6 +530,19 @@ fn draw_scrollback(f: &mut Frame, app: &mut App, th: &Theme, r: Rect, layout: &m
                 buf.set_string(x0, sy, g, st);
             }
         }
+        if let Some(md) = md {
+            let starts = crate::markdown::code_block_starts(lines, th.bg_raised);
+            for (li, (lang, code)) in starts.into_iter().zip(crate::markdown::code_blocks(md)) {
+                let row = start + li;
+                if row < first_vis || row >= last_vis {
+                    continue;
+                }
+                let sy = r.y + (row - top) as u16;
+                if let Some(b) = draw_copy_button(buf, th, &lines[li], &lang, cx, sy, content_w) {
+                    layout.code_copy.push((sy, b.0, b.1, code));
+                }
+            }
+        }
         // Fold caret over the bullet on the selected header row.
         if selected && entry.foldable() && start >= top && start < top + view_h {
             let sy = r.y + (start - top) as u16;
@@ -575,6 +588,32 @@ fn unroll(e: &Entry, lines: Rc<Vec<Line<'static>>>, hdr: usize) -> Rc<Vec<Line<'
     let body = lines.len() - head;
     let keep = head + (body as f32 * ease_out(t)).ceil() as usize;
     if keep >= lines.len() { lines } else { Rc::new(lines[..keep].to_vec()) }
+}
+
+/// Draw a code block's "copy" button on its first row `line`, already drawn at
+/// (`cx`, `sy`): inside the block left of the language label when that spot is
+/// blank, else just right of the block. Returns the button's columns.
+fn draw_copy_button(buf: &mut Buffer, th: &Theme, line: &Line, lang: &str, cx: u16, sy: u16, content_w: u16) -> Option<(u16, u16)> {
+    const LABEL: &str = "copy";
+    let w = LABEL.len() as u16;
+    let line_w = (line_width(line) as u16).min(content_w);
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let lang_w = crate::text::width(lang) as u16;
+    // The renderer puts the language label one column in from the block's right edge.
+    let has_label = lang_w > 0 && text.trim_end().ends_with(lang);
+    let end = if has_label { line_w.saturating_sub(1 + lang_w + 2) } else { line_w.saturating_sub(1) };
+    let x0 = end.saturating_sub(w);
+    let blank = end >= w + 1
+        && (x0 - 1..end).all(|x| buf.cell((cx + x, sy)).is_some_and(|c| c.symbol() == " "));
+    let (x0, style) = if blank {
+        (x0, Style::default().fg(th.gray).bg(th.bg_raised))
+    } else if line_w + 1 + w <= content_w {
+        (line_w + 1, Style::default().fg(th.gray))
+    } else {
+        return None;
+    };
+    buf.set_string(cx + x0, sy, LABEL, style);
+    Some((cx + x0, cx + x0 + w))
 }
 
 fn rail_for(entry: &Entry, selected: bool, th: &Theme, tick: u64, row: u16) -> Option<(&'static str, Style)> {
@@ -1604,6 +1643,26 @@ mod tests {
     use super::*;
     use crate::app::SessionKind;
     use crate::config::Config;
+
+    #[test]
+    fn copy_button_sits_beside_the_language_label() {
+        let th = Theme::blush();
+        let row = |buf: &Buffer| (0..40).map(|x| buf.cell((x, 0)).unwrap().symbol().to_string()).collect::<String>();
+        let draw = |md: &str, lang: &str| {
+            let lines = crate::markdown::render(md, 30, &th);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 40, 1));
+            buf.set_line(0, 0, &lines[0], 40);
+            let hit = draw_copy_button(&mut buf, &th, &lines[0], lang, 0, 0, 40);
+            (row(&buf), hit)
+        };
+        let (text, hit) = draw("```rust\nfn main() {}\n```", "rust");
+        assert_eq!(text.trim_end(), " fn main() {}      copy  rust", "{text:?}");
+        assert_eq!(hit, Some((19, 23)));
+        // No room inside: the button goes right of the block.
+        let (text, hit) = draw("```\nlet a_very_long_line = 1234567890;\n```", "");
+        assert_eq!(hit, Some((31, 35)), "{text:?}");
+        assert_eq!(&text[31..35], "copy", "{text:?}");
+    }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;

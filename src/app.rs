@@ -284,6 +284,8 @@ pub struct LayoutInfo {
     pub bg_button: Option<Rect>,
     /// Clickable links on screen: (row, x start, x end exclusive, url).
     pub links: Vec<(u16, u16, u16, String)>,
+    /// Code blocks' copy buttons: (row, x start, x end exclusive, code).
+    pub code_copy: Vec<(u16, u16, u16, String)>,
     /// Compact mode: (screen row, anchor entry) of expanded groups' header lines.
     pub group_rows: Vec<(u16, usize)>,
     pub total_lines: usize,
@@ -2468,6 +2470,11 @@ impl App {
                 }
                 if self.layout.prompt_area.contains((x, y).into()) {
                     self.focus = Focus::Prompt;
+                    return;
+                }
+                if let Some((_, _, _, code)) = self.layout.code_copy.iter().find(|(cy, x0, x1, _)| *cy == y && x >= *x0 && x < *x1) {
+                    let code = code.clone();
+                    self.copy(&code);
                     return;
                 }
                 if let Some((_, _, _, url)) = self.layout.links.iter().find(|(ly, x0, x1, _)| *ly == y && x >= *x0 && x < *x1) {

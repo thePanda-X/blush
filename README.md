@@ -219,7 +219,7 @@ share = true         # share running TUI sessions while the server is up
 | `Alt+K` | Show context usage |
 | `Alt+H` · `Alt+S` · `Alt+N` | Toggle thinking blocks / timestamps / narrator |
 | `PgUp` / `PgDn`, mouse wheel | Scroll |
-| Click | Click a block to select it; click its header to fold it |
+| Click | Click a block to select it; click its header to fold it; click `copy` on a code block to copy its code |
 | `Ctrl+.` / `F1` | Show all shortcuts |
 
 > **Tip:** Hold **Shift** while dragging to use your terminal's own text selection.
